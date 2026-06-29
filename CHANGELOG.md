@@ -18,7 +18,7 @@ exactly.
   - **High-poly vertex threshold** — objects with at least this many vertices
     use the optimized paths (default 500,000).
   - **Cursor wireframe radius (px)** — pixel radius of the cursor-local
-    wireframe (default 40).
+    wireframe (default 60).
 
 ### Changed
 - Closest-point lookup on heavy scenes now uses a vectorized screen-space range

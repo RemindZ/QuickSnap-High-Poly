@@ -933,7 +933,7 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
         name="Cursor wireframe radius (px)",
         description="Pixel radius around the cursor for the high-poly cursor-local wireframe."
                     " A bit larger than the snap radius so the wire reads as context",
-        default=40, min=10, max=400)
+        default=60, min=10, max=400)
 
     snap_source_type: bpy.props.EnumProperty(
         name="Snap From",
