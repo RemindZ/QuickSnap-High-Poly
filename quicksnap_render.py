@@ -172,29 +172,26 @@ def draw_lines_3d(coords, color=(1, 1, 0, 1), line_width=1, depth_test=False):
 def build_local_wire_cache(self, context, snapdata, object_name):
     """
     Build (once per view) the per-object data needed to draw the cursor-local wireframe:
-    full-length vertex screen coords, camera-offset world coords, a validity mask and the
-    edge->vertex-pair array. Cached on self.local_wire_data and invalidated when the
-    ObjectPointData instance changes (which happens whenever the view matrix changes and the
-    SnapData is rebuilt). Returns the cache dict, or None when a local wire cannot be built.
+    full-length vertex world coords, vertex screen coords, and the edge->vertex-pair array.
+
+    This is self-contained: it projects ALL of the object's vertices itself rather than reusing
+    the snap ingestion, so (a) it works for every snap type (Vertices / Edge mid-points / Face
+    centers / Origins), and (b) it has world coords for every endpoint - including vertices off
+    screen or behind the camera - so an edge with one endpoint near the cursor is drawn in full,
+    even across large flat faces. Cached on self.local_wire_data and invalidated when the view
+    matrix changes (the cache is dropped in init_snap_data, and also re-checked against the
+    perspective matrix here). Returns the cache dict, or None when a wire cannot be built.
     """
-    # The cursor-local wire reuses ingested per-vertex screen coords, which only exist for the
-    # POINTS snap type (MIDPOINTS/FACES ingest edge/face centers, not vertex indices).
-    if snapdata.snap_type != 'POINTS':
-        return None
-    point_data = snapdata.objects_point_data.get(object_name)
-    if point_data is None or getattr(point_data, "is_curve", False) or point_data.count == 0:
-        return None
     obj = bpy.data.objects.get(object_name)
     if obj is None or obj.type != 'MESH':
         return None
 
     cache = self.local_wire_data.get(object_name)
-    if cache is not None and cache.get("pid") == id(point_data):
+    if cache is not None and cache.get("matrix") == snapdata.perspective_matrix:
         return cache  # Still valid for the current view.
 
-    # Use the same mesh data (evaluated or raw) that ingestion used in ObjectPointData, so the
-    # vertex indices stored in point_data.indices line up with data.vertices/data.edges here.
-    # This mirrors the evaluated/raw selection in SnapData.add_object_data.
+    # Use the same mesh data (evaluated or raw) that snap ingestion used, so the wireframe matches
+    # the mesh that is actually snappable. Mirrors the evaluated/raw selection in add_object_data.
     is_selected = object_name in self.selection_objects
     if is_selected:
         use_evaluated = self.object_mode and not self.settings.ignore_modifiers
@@ -206,26 +203,36 @@ def build_local_wire_cache(self, context, snapdata, object_name):
         data = obj.data
 
     n_verts = len(data.vertices)
-    indices = np.asarray(point_data.indices, dtype=np.int64)
-    if n_verts == 0 or len(indices) == 0 or indices.max(initial=-1) >= n_verts:
+    n_edges = len(data.edges)
+    if n_verts == 0 or n_edges == 0:
         return None
 
-    vert_screen = np.full((n_verts, 2), np.inf, dtype=np.float64)
-    vert_world = np.zeros((n_verts, 3), dtype=np.float64)
-    valid = np.zeros(n_verts, dtype=bool)
-    vert_screen[indices] = point_data.screen_space_co[:, :2]
-    vert_world[indices] = point_data.world_space_co
-    valid[indices] = True
+    # Object-space vertex coords -> world space (kept for drawing) -> screen space (for the
+    # near-cursor test). Same projection math as ObjectPointData.
+    co = np.empty(n_verts * 3, dtype=np.float64)
+    data.vertices.foreach_get('co', co)
+    co.shape = (n_verts, 3)
+    homog = np.ones((n_verts, 4), dtype=np.float64)
+    homog[:, :3] = co
+    world_h = np.einsum('ij,aj->ai', np.array(obj.matrix_world), homog)
+    vert_world = world_h[:, :3]
 
-    edge_verts = np.zeros(len(data.edges) * 2, dtype=np.int64)
+    proj = np.einsum('ij,aj->ai', np.array(snapdata.perspective_matrix), world_h)
+    w = proj[:, 3]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        sx = snapdata.width_half + (proj[:, 0] / w) * snapdata.width_half
+        sy = snapdata.height_half + (proj[:, 1] / w) * snapdata.height_half
+    vert_screen = np.column_stack((sx, sy))
+    vert_screen[w <= 0] = np.inf  # Behind the camera -> never counts as near the cursor.
+
+    edge_verts = np.zeros(n_edges * 2, dtype=np.int64)
     data.edges.foreach_get('vertices', edge_verts)
-    edge_verts.shape = (len(data.edges), 2)
+    edge_verts.shape = (n_edges, 2)
 
     cache = {
-        "pid": id(point_data),
+        "matrix": snapdata.perspective_matrix.copy(),
         "vert_screen": vert_screen,
         "vert_world": vert_world,
-        "valid": valid,
         "edge_verts": edge_verts,
     }
     self.local_wire_data[object_name] = cache
@@ -236,7 +243,8 @@ def draw_local_wireframe(self, context, snapdata, object_name, color=(0.7, 0.7, 
     """
     Draw a wireframe limited to the mesh edges near the cursor, for heavy objects where the native
     show_wire overlay is too expensive. Per frame this only masks edges by screen distance to the
-    mouse (vectorized numpy) and draws a single LINES batch.
+    mouse (vectorized numpy) and draws a single LINES batch. An edge is drawn whenever EITHER
+    endpoint is within the radius, so edges spanning large flat faces are drawn in full.
     """
     cache = build_local_wire_cache(self, context, snapdata, object_name)
     if cache is None:
@@ -247,13 +255,12 @@ def draw_local_wireframe(self, context, snapdata, object_name, color=(0.7, 0.7, 
     vert_screen = cache["vert_screen"]
     dx = vert_screen[:, 0] - mouse_x
     dy = vert_screen[:, 1] - mouse_y
-    near = (dx * dx + dy * dy) < (radius * radius)  # inf coords (culled verts) compare False.
+    near = (dx * dx + dy * dy) < (radius * radius)  # inf coords (behind camera) compare False.
 
     edge_verts = cache["edge_verts"]
     a = edge_verts[:, 0]
     b = edge_verts[:, 1]
-    valid = cache["valid"]
-    edge_mask = (near[a] | near[b]) & valid[a] & valid[b]
+    edge_mask = near[a] | near[b]
     selected = edge_verts[edge_mask]
     if len(selected) == 0:
         return
