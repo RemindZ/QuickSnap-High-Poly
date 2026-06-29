@@ -143,6 +143,141 @@ def draw_line_3d(source, target, color=(1, 1, 0, 1), line_width=1, depth_test=Fa
         gpu.state.depth_test_set("NONE")
 
 
+def draw_lines_3d(coords, color=(1, 1, 0, 1), line_width=1, depth_test=False):
+    """
+        Draw many 3d line segments as a single LINES batch.
+        `coords` is a flat sequence of point pairs: [a0, b0, a1, b1, ...] (each point a 3-sequence).
+        Used by the cursor-local wireframe to draw one batch per frame instead of one call per edge.
+    """
+    if coords is None or len(coords) == 0:
+        return
+    if line_width != 1:
+        gpu.state.line_width_set(line_width)
+    gpu.state.blend_set("ALPHA")
+    if depth_test:
+        gpu.state.depth_test_set("LESS")
+
+    batch = batch_for_shader(shader_3d_uniform_color, 'LINES', {"pos": coords})
+    shader_3d_uniform_color.bind()
+    shader_3d_uniform_color.uniform_float("color", color)
+    batch.draw(shader_3d_uniform_color)
+
+    if line_width != 1:
+        gpu.state.line_width_set(1)
+    gpu.state.blend_set("NONE")
+    if depth_test:
+        gpu.state.depth_test_set("NONE")
+
+
+def build_local_wire_cache(self, context, snapdata, object_name):
+    """
+    Build (once per view) the per-object data needed to draw the cursor-local wireframe:
+    full-length vertex screen coords, camera-offset world coords, a validity mask and the
+    edge->vertex-pair array. Cached on self.local_wire_data and invalidated when the
+    ObjectPointData instance changes (which happens whenever the view matrix changes and the
+    SnapData is rebuilt). Returns the cache dict, or None when a local wire cannot be built.
+    """
+    # The cursor-local wire reuses ingested per-vertex screen coords, which only exist for the
+    # POINTS snap type (MIDPOINTS/FACES ingest edge/face centers, not vertex indices).
+    if snapdata.snap_type != 'POINTS':
+        return None
+    point_data = snapdata.objects_point_data.get(object_name)
+    if point_data is None or getattr(point_data, "is_curve", False) or point_data.count == 0:
+        return None
+    obj = bpy.data.objects.get(object_name)
+    if obj is None or obj.type != 'MESH':
+        return None
+
+    cache = self.local_wire_data.get(object_name)
+    if cache is not None and cache.get("pid") == id(point_data):
+        return cache  # Still valid for the current view.
+
+    # Use the same mesh data (evaluated or raw) that ingestion used in ObjectPointData, so the
+    # vertex indices stored in point_data.indices line up with data.vertices/data.edges here.
+    # This mirrors the evaluated/raw selection in SnapData.add_object_data.
+    is_selected = object_name in self.selection_objects
+    if is_selected:
+        use_evaluated = self.object_mode and not self.settings.ignore_modifiers
+    else:
+        use_evaluated = not self.settings.ignore_modifiers
+    if use_evaluated:
+        data = obj.evaluated_get(context.evaluated_depsgraph_get()).data
+    else:
+        data = obj.data
+
+    n_verts = len(data.vertices)
+    indices = np.asarray(point_data.indices, dtype=np.int64)
+    if n_verts == 0 or len(indices) == 0 or indices.max(initial=-1) >= n_verts:
+        return None
+
+    vert_screen = np.full((n_verts, 2), np.inf, dtype=np.float64)
+    vert_world = np.zeros((n_verts, 3), dtype=np.float64)
+    valid = np.zeros(n_verts, dtype=bool)
+    vert_screen[indices] = point_data.screen_space_co[:, :2]
+    vert_world[indices] = point_data.world_space_co
+    valid[indices] = True
+
+    edge_verts = np.zeros(len(data.edges) * 2, dtype=np.int64)
+    data.edges.foreach_get('vertices', edge_verts)
+    edge_verts.shape = (len(data.edges), 2)
+
+    cache = {
+        "pid": id(point_data),
+        "vert_screen": vert_screen,
+        "vert_world": vert_world,
+        "valid": valid,
+        "edge_verts": edge_verts,
+    }
+    self.local_wire_data[object_name] = cache
+    return cache
+
+
+def draw_local_wireframe(self, context, snapdata, object_name, color=(0.7, 0.7, 0.7, 0.5)):
+    """
+    Draw a wireframe limited to the mesh edges near the cursor, for heavy objects where the native
+    show_wire overlay is too expensive. Per frame this only masks edges by screen distance to the
+    mouse (vectorized numpy) and draws a single LINES batch.
+    """
+    cache = build_local_wire_cache(self, context, snapdata, object_name)
+    if cache is None:
+        return
+
+    radius = self.settings.local_wireframe_radius
+    mouse_x, mouse_y = self.mouse_position[0], self.mouse_position[1]
+    vert_screen = cache["vert_screen"]
+    dx = vert_screen[:, 0] - mouse_x
+    dy = vert_screen[:, 1] - mouse_y
+    near = (dx * dx + dy * dy) < (radius * radius)  # inf coords (culled verts) compare False.
+
+    edge_verts = cache["edge_verts"]
+    a = edge_verts[:, 0]
+    b = edge_verts[:, 1]
+    valid = cache["valid"]
+    edge_mask = (near[a] | near[b]) & valid[a] & valid[b]
+    selected = edge_verts[edge_mask]
+    if len(selected) == 0:
+        return
+
+    vert_world = cache["vert_world"]
+    coords = np.empty((len(selected) * 2, 3), dtype=np.float64)
+    coords[0::2] = vert_world[selected[:, 0]]
+    coords[1::2] = vert_world[selected[:, 1]]
+
+    # Apply the camera offset only to this small near-cursor subset (cheap per frame), to avoid
+    # z-fighting with the solid mesh - matches the look of the existing edge highlight.
+    region3d = context.space_data.region_3d
+    camera_position = np.array(region3d.view_matrix.inverted().translation, dtype=np.float64)
+    cam_to = camera_position[None, :] - coords
+    if not region3d.is_perspective:
+        camera_vector = np.array(region3d.view_rotation @ Vector((0.0, 0.0, -1.0)), dtype=np.float64)
+        dist = np.sqrt(np.einsum('ij,ij->i', cam_to, cam_to))
+        coords = coords - camera_vector[None, :] * dist[:, None] * 0.01
+    else:
+        coords = coords + cam_to * 0.01
+
+    draw_lines_3d(coords.astype(np.float32).tolist(), color=color, line_width=1, depth_test=True)
+
+
 def draw_line_3d_smooth_blend(source, target, color_a=(1, 0, 0, 1), color_b=(0, 1, 0, 1), line_width=1,
                               depth_test=False):
     """
@@ -343,6 +478,12 @@ def draw_callback_3d(self, context):
         Draw all 3D ui for QuickSnap: Snap axis, edge/points highlight.
     """
     draw_snap_axis(self, context)
+    # Cursor-local wireframe for heavy objects (replaces the native show_wire overlay).
+    if getattr(self, "local_wire_objects", None):
+        wire_snapdata = self.snapdata_source if self.current_state == State.IDLE else self.snapdata_target
+        if wire_snapdata is not None:
+            for wire_object_name in list(self.local_wire_objects):
+                draw_local_wireframe(self, context, wire_snapdata, wire_object_name)
     if self.current_state == State.IDLE and not (self.object_mode and self.no_selection):
         coords = [self.snapdata_source.world_space[objectid] for objectid in self.snapdata_source.origins_map]
     else:

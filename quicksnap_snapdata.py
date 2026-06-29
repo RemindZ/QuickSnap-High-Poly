@@ -251,13 +251,29 @@ class SnapData:
 
         # Initialize kdtrees-target points nparray with correct size
         max_vertex_count = self.get_max_vertex_count(context, selected_meshes, scene_meshes)
-        self.kd = mathutils.kdtree.KDTree(max_vertex_count)
+
+        # Heavy-mesh gate: above the threshold, skip building a KDTree over millions of points
+        # (the upfront stall + memory blowup) and use a vectorized screen-space range query instead.
+        # Light scenes keep the exact KDTree path. Origins always stay on the tiny kd_origins tree.
+        self.use_numpy_query = (max_vertex_count >= getattr(settings, "heavy_mesh_threshold", 500000)
+                                and getattr(settings, "optimize_heavy_meshes", True))
+        if self.use_numpy_query:
+            # self.kd only needs to hold object origins + cursor in this mode (it is not queried for
+            # mesh points), so size it to a small safe upper bound instead of max_vertex_count.
+            origin_capacity = len(selected_meshes) + len(scene_meshes) + 2
+            self.kd = mathutils.kdtree.KDTree(origin_capacity)
+        else:
+            self.kd = mathutils.kdtree.KDTree(max_vertex_count)
         self.world_space = np.empty((max_vertex_count, 3), dtype=np.float64)
         self.region_2d = np.empty((max_vertex_count, 3), dtype=np.float64)
         self.depth = np.empty(max_vertex_count, dtype=np.float64)
         self.indices = np.empty(max_vertex_count, dtype=int)
         self.spline_index = np.empty(max_vertex_count, dtype=int)
         self.object_id = np.empty(max_vertex_count, dtype=int)
+        # Tracks which stored points participate in the (non-origin) closest-point query, mirroring
+        # which points the KDTree path would have inserted. Object points: always; origins: only
+        # when snap_objects_origin == 'ALWAYS' (same condition as add_to_kd in add_point).
+        self.in_query = np.zeros(max_vertex_count, dtype=bool)
         self.added_points_np = 0
 
         # figure out origin count
@@ -480,6 +496,7 @@ class SnapData:
         self.region_2d[current_index] = (coord_2d[0], coord_2d[1], view_space_projection.w * 0.00000001)
         self.indices[current_index] = -1
         self.object_id[current_index] = object_index
+        self.in_query[current_index] = add_to_kd
         if add_to_kd:
             self.kd.insert(self.region_2d[current_index], current_index)
         self.added_points_np += 1
@@ -509,6 +526,7 @@ class SnapData:
         self.region_2d[start_insert:end_insert, 2] = points_data.screen_space_co[start_index:end_index, 2] * 0.00000001
         self.depth[start_insert:end_insert] = points_data.screen_space_co[start_index:end_index, 2]
         self.object_id[start_insert:end_insert] = np.full(insert_count, points_data.object_id, dtype=int)
+        self.in_query[start_insert:end_insert] = True
         self.indices[start_insert:end_insert] = points_data.indices[start_index:end_index]
         if points_data.is_curve:
             self.spline_index[start_insert:end_insert] = points_data.spline_index[start_index:end_index]
@@ -527,6 +545,10 @@ class SnapData:
         If is not set, only balance the trees.
         """
         logger.debug(f"balance_tree - Source:{self.is_origin_snapdata}")
+        # In heavy-mesh mode the KDTree is not used for mesh points (find_closest queries the numpy
+        # arrays directly), so skip the O(N log N) insert/balance that causes the upfront stall.
+        if self.use_numpy_query:
+            return
         if start_index is not None and end_index is not None:
             logger.debug(f"balance_tree - start_index:{start_index} - end_index:{end_index}")
             insert = self.kd.insert
@@ -628,29 +650,57 @@ class SnapData:
         else:
             # Search all points
             search_distance = 20  # Radius in pixels around the mouse position
-            points_found = self.kd.find_range(mouse_coord_screen_flat, search_distance)
-            if len(points_found) > 0:
-                points_array = np.array(points_found, dtype=object)
+            weight_depth = 3
+            weight_dist = 1
+            if self.use_numpy_query:
+                # Heavy-mesh path: vectorized screen-space range query directly on region_2d,
+                # avoiding the KDTree build entirely. Scoring matches the KDTree path exactly.
+                n = self.added_points_np
+                if n > 0:
+                    coords = self.region_2d[:n]
+                    dx = coords[:, 0] - mouse_coord_screen_flat[0]
+                    dy = coords[:, 1] - mouse_coord_screen_flat[1]
+                    d2 = dx * dx + dy * dy
+                    mask = (d2 < search_distance * search_distance) & self.in_query[:n]
+                    found_idx = np.nonzero(mask)[0]
+                    if len(found_idx) > 0:
+                        dists = np.sqrt(d2[found_idx])
+                        dist = dists / search_distance
 
-                # normalize distance
-                dist = points_array[:, 2] / search_distance
+                        # Depth was multiplied by 10e-8 so it would not affect the kdtree search.
+                        depth = coords[found_idx, 2] * 100000000
+                        depth = depth / np.amax(depth)  # Normalized depth
 
-                # Convert <Vector> array into <float, float,float> array.
-                depth = np.array([x for x in points_array[:, 0]])
-                # Depth was multiplied by 10e-8 for depth to not affect kdtree closest search.
-                depth = depth[:, 2] * 100000000
-                depth = depth / np.amax(depth)  # Normalized depth
-                weight_depth = 3
-                weight_dist = 1
+                        score = (depth * weight_depth + dist * weight_dist + dist * depth) / (
+                                weight_depth + weight_dist)
+                        best_match_i = np.argmin(score)
+                        match_index = int(found_idx[best_match_i])
+                        best_dist = float(dists[best_match_i])
+                        origin = self.world_space[match_index]
+                        mesh_index = self.indices[match_index]
+                        close_points.append((origin, match_index, best_dist, best_dist, mesh_index))
+            else:
+                points_found = self.kd.find_range(mouse_coord_screen_flat, search_distance)
+                if len(points_found) > 0:
+                    points_array = np.array(points_found, dtype=object)
 
-                score = (depth * weight_depth + dist * weight_dist + dist * depth) / (weight_depth + weight_dist)
+                    # normalize distance
+                    dist = points_array[:, 2] / search_distance
 
-                best_match_i = np.argmin(score)  # index of best score within the points found.
-                match_index = points_found[best_match_i][1]  # index of best score within all points arrays
-                origin = self.world_space[match_index]
-                mesh_index = self.indices[match_index]
-                close_points.append((origin, match_index, points_found[best_match_i][2], points_found[best_match_i][2],
-                                     mesh_index))
+                    # Convert <Vector> array into <float, float,float> array.
+                    depth = np.array([x for x in points_array[:, 0]])
+                    # Depth was multiplied by 10e-8 for depth to not affect kdtree closest search.
+                    depth = depth[:, 2] * 100000000
+                    depth = depth / np.amax(depth)  # Normalized depth
+
+                    score = (depth * weight_depth + dist * weight_dist + dist * depth) / (weight_depth + weight_dist)
+
+                    best_match_i = np.argmin(score)  # index of best score within the points found.
+                    match_index = points_found[best_match_i][1]  # index of best score within all points arrays
+                    origin = self.world_space[match_index]
+                    mesh_index = self.indices[match_index]
+                    close_points.append((origin, match_index, points_found[best_match_i][2],
+                                         points_found[best_match_i][2], mesh_index))
 
         # sort possible closest points if more than one point
         if len(close_points) == 1:

@@ -134,6 +134,31 @@ def get_addon_settings():
     return None
 
 
+def get_object_vertex_count(obj):
+    """
+    Returns an approximate snappable-vertex count for an object, used to gate the heavy-mesh
+    optimization paths. Cheap (just len() on the mesh data), so safe to call per object.
+    """
+    if obj is None:
+        return 0
+    if obj.type == 'MESH':
+        return len(obj.data.vertices)
+    return 0
+
+
+def is_heavy_object(obj, settings=None):
+    """
+    Returns True when the object should use the heavy-mesh optimization paths (cursor-local
+    wireframe, localized numpy query). Gated on the user-configurable vertex threshold so that
+    light meshes keep the exact same behavior as before.
+    """
+    if settings is None:
+        settings = get_addon_settings()
+    if settings is None or not getattr(settings, "optimize_heavy_meshes", True):
+        return False
+    return get_object_vertex_count(obj) >= settings.heavy_mesh_threshold
+
+
 def get_axis_target(origin, target, axis_constraint, obj=None):
     """
     Returns the snapping target taking into account constrain options

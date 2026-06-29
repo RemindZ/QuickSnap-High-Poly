@@ -93,6 +93,8 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.perspective_matrix_inverse = self.perspective_matrix.inverted()
         self.target_bounds = {}
         self.target_npdata = {}
+        self.local_wire_objects = set()
+        self.local_wire_data = {}
         self.no_selection_target = None
         self.ignore_modifiers = self.settings.ignore_modifiers
         self.target_face_index = -1
@@ -149,6 +151,9 @@ class QuickVertexSnapOperator(bpy.types.Operator):
                                                               bpy.data.objects[object_name].display_bounds_type)
 
     def revert_object_display(self, object_name):
+        # Clear the cursor-local wireframe flag in the same place native display is reverted, so
+        # nothing persists after the operator exits.
+        self.local_wire_objects.discard(object_name)
         if object_name in self.target_object_display_backup:
             (bpy.data.objects[object_name].show_wire,
              bpy.data.objects[object_name].show_name,
@@ -168,7 +173,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         if target_object != "":
             self.store_object_display(target_object)
             if self.settings.display_target_wireframe:
-                bpy.data.objects[target_object].show_wire = True
+                self._apply_wireframe_display(target_object)
             if is_root:
                 bpy.data.objects[target_object].show_name = True
 
@@ -178,10 +183,21 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         if hover_object != "" and hover_object != target_object:
             self.store_object_display(hover_object)
             if self.settings.display_target_wireframe:
-                bpy.data.objects[hover_object].show_wire = True
+                self._apply_wireframe_display(hover_object)
 
         self.hover_object = hover_object
         self.closest_vertexid = mesh_vertid
+
+    def _apply_wireframe_display(self, object_name):
+        """
+        Enable a wireframe overlay for the target/hover object. For heavy meshes, skip the native
+        all-edges show_wire (the dominant sustained cost) and flag the object for the cursor-local
+        wireframe drawn in draw_callback_3d. Light meshes keep the native overlay exactly as before.
+        """
+        if quicksnap_utils.is_heavy_object(bpy.data.objects[object_name], self.settings):
+            self.local_wire_objects.add(object_name)
+        else:
+            bpy.data.objects[object_name].show_wire = True
 
     def revert_data(self, context, apply=False):
         """
@@ -391,6 +407,8 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.hotkey_shift = True
         self.menu_open = False
         self.hover_object = ""
+        self.local_wire_objects = set()
+        self.local_wire_data = {}
         self.target_bounds = None
         self.source_highlight_data = None
         self.source_allowed_indices = None
@@ -443,6 +461,14 @@ class QuickVertexSnapOperator(bpy.types.Operator):
     def refresh_vertex_data(self, context, region):
         """
         Re-Init the snapdata if the view camera moved. (Updates 2d positions of all points)
+
+        Screen-space projection is a function of the view/perspective matrix only, never of the
+        mouse. This guard is the projection cache: it compares the current view matrix, perspective
+        matrix, view distance and camera zoom against the snapshot taken when the SnapData was last
+        built, and bails out when they are unchanged. On a mouse-move-only frame nothing here runs,
+        so no point gets re-projected - only the closest-point query (in update()) executes.
+        Invalidation fires on any orbit/pan/zoom (including between the two clicks of the workflow),
+        because those change the view matrix and therefore camera_position/perspective_matrix below.
         """
         region3d = context.space_data.region_3d
         if self.camera_position == region3d.view_matrix.inverted().translation \
@@ -796,6 +822,9 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         pass
 
     def init_snap_data(self, context, region, revert_source, revert_target):
+        # The local-wire cache is keyed to the (now stale) ObjectPointData instances; drop it so it
+        # rebuilds against the new projection.
+        self.local_wire_data = {}
         if revert_source:
             self.snapdata_source.__init__(context, region, self.settings, self.selection_objects,
                                           quicksnap_utils.get_scene_objects(False), is_origin=True,
@@ -884,6 +913,28 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
                                                             , default=True)
     ignore_modifiers: bpy.props.BoolProperty(name="Ignore modifiers (For heavy scenes)", default=False)
 
+    # ---------------------------------------------------------------------------------------------
+    # High-poly performance settings.
+    # These gate the heavy-mesh optimization paths (cursor-local wireframe + localized numpy query).
+    # Light meshes (below the threshold) keep the original behavior exactly.
+    # ---------------------------------------------------------------------------------------------
+    optimize_heavy_meshes: bpy.props.BoolProperty(
+        name="Optimize high-poly meshes",
+        description="Enable the high-poly optimization paths for objects above the vertex threshold:"
+                    " a cursor-local wireframe instead of the native full-object overlay, and a"
+                    " localized point query instead of building a KDTree over millions of points",
+        default=True)
+    heavy_mesh_threshold: bpy.props.IntProperty(
+        name="High-poly vertex threshold",
+        description="Objects with at least this many vertices use the optimized high-poly paths."
+                    " Meshes below this count keep the original behavior",
+        default=500000, min=1000, soft_max=10000000)
+    local_wireframe_radius: bpy.props.IntProperty(
+        name="Cursor wireframe radius (px)",
+        description="Pixel radius around the cursor for the high-poly cursor-local wireframe."
+                    " A bit larger than the snap radius so the wire reads as context",
+        default=40, min=10, max=400)
+
     snap_source_type: bpy.props.EnumProperty(
         name="Snap From",
         items=[
@@ -958,6 +1009,12 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
         col.use_property_split = True
         col.prop(self, "ignore_modifiers")
         col.prop(self, "use_auto_merge")
+        heavy_box = col.box().column()
+        heavy_box.label(text="High-poly performance:")
+        heavy_box.prop(self, "optimize_heavy_meshes")
+        if self.optimize_heavy_meshes:
+            heavy_box.prop(self, "heavy_mesh_threshold")
+            heavy_box.prop(self, "local_wireframe_radius")
         col.prop(self, "snap_objects_origin")
         col.prop(self, "draw_rubberband")
         col.prop(self, "display_target_wireframe")
