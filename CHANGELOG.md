@@ -14,10 +14,10 @@ exactly.
   replaced by a wireframe limited to the edges near the cursor. This keeps the
   viewport interactive when hovering very dense meshes.
 - New preferences under "High-poly performance":
-  - **Optimize high-poly meshes** — master toggle for the optimized paths.
-  - **High-poly vertex threshold** — objects with at least this many vertices
+  - **Optimize high-poly meshes**: master toggle for the optimized paths.
+  - **High-poly vertex threshold**: objects with at least this many vertices
     use the optimized paths (default 500,000).
-  - **Cursor wireframe radius (px)** — pixel radius of the cursor-local
+  - **Cursor wireframe radius (px)**: pixel radius of the cursor-local
     wireframe (default 60).
 
 ### Changed
