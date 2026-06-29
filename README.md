@@ -8,7 +8,7 @@ https://user-images.githubusercontent.com/35562774/195340412-6931d8f0-045d-4c4d-
 If the video is not playing for you, you can watch it here: https://youtu.be/9cWV0JELM88
 
 ## Update Notes:
-Check the [Release Page](https://github.com/JulienHeijmans/quicksnap/releases) to learn about the latest updates.
+Check the [Release Page](https://github.com/JulienHeijmans/quicksnap/releases) to learn about the latest updates, or see the [CHANGELOG](CHANGELOG.md).
 
 ## Features:
 * Snap From/To:
@@ -50,6 +50,7 @@ Check the [Release Page](https://github.com/JulienHeijmans/quicksnap/releases) t
 
 * Constrain the translation on a single axis or a plane using (Shift+)X,Y,Z hotkeys
 * Automatically display wireframe of the mesh you are snapping to and the wireframe of the object right under the mouse (Can be turned off)
+* High-poly friendly: objects above a configurable vertex threshold use a cursor-local wireframe and a localized point query, so the tool stays responsive on dense meshes (millions of vertices) without changing which points you can snap to. See the "High-poly performance" section in the add-on preferences.
 * Snap onto visible and non visible points (Points closer to the camera are prioritized)
 * Highlight target vertex edges, as well as potential target edge midpoint and target facecenters for better readability
     ![target_highlight](https://user-images.githubusercontent.com/35562774/196428455-6ba30a31-faeb-4c7c-9dbc-9b3dcca08af3.gif)
@@ -94,10 +95,9 @@ If you want to cancel the operation:
 * Press Right Mouse Button or ESC key to cancel the translation
 
 ## Important notes:
-This tool is not made to use on very high poly objects, and performance might get poor when many really heavy objects are under the mouse.
-If performances are poor, hiding objects/collections that you don't want to snap onto will help.
+Since version 1.5.0 the tool handles high-poly objects much better: objects above a configurable vertex threshold (default 500,000 vertices, set in the add-on preferences under "High-poly performance") switch to a cursor-local wireframe and a localized point query, avoiding the per-frame overlay cost and the upfront stall that used to happen when a heavy object entered snap range.
 
-I am saying this but the tool should be efficient enough in most cases.
+If performance is still poor on extremely dense scenes, hiding objects/collections that you don't want to snap onto will help. You can also lower the threshold so more objects use the optimized paths, or disable the optimization entirely from the preferences.
 
 
 ## Update the Add-On
