@@ -95,6 +95,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.target_npdata = {}
         self.local_wire_objects = set()
         self.local_wire_data = {}
+        self.perf_wire_ms = 0.0
         self.no_selection_target = None
         self.ignore_modifiers = self.settings.ignore_modifiers
         self.target_face_index = -1
@@ -407,6 +408,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.hover_object = ""
         self.local_wire_objects = set()
         self.local_wire_data = {}
+        self.perf_wire_ms = 0.0
         self.target_bounds = None
         self.source_highlight_data = None
         self.source_allowed_indices = None
@@ -489,11 +491,17 @@ class QuickVertexSnapOperator(bpy.types.Operator):
             self.refresh_vertex_data(context, region)
         snapdata_updated = False
         if self.current_state == State.IDLE:
+            ti = time.perf_counter()
             snapdata_updated = snapdata_updated or self.snapdata_source.process_iteration(context)
+            self.snapdata_source.processing_time_total += time.perf_counter() - ti
             if not self.snapdata_source.keep_processing:  # if all source are processed, start processing target points
+                ti = time.perf_counter()
                 snapdata_updated = snapdata_updated or self.snapdata_target.process_iteration(context)
+                self.snapdata_target.processing_time_total += time.perf_counter() - ti
         else:
+            ti = time.perf_counter()
             snapdata_updated = snapdata_updated or self.snapdata_target.process_iteration(context)
+            self.snapdata_target.processing_time_total += time.perf_counter() - ti
         context.area.tag_redraw()
 
         self.handle_hotkeys(context, event, region)

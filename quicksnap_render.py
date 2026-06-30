@@ -2,6 +2,7 @@
 
 import bpy
 import bpy_extras
+import blf
 import gpu
 import logging
 import numpy as np
@@ -271,6 +272,42 @@ def draw_local_wireframe(self, context, snapdata, object_name, color=(0.7, 0.7, 
     draw_lines_3d(coords.astype(np.float32).tolist(), color=color, line_width=1, depth_test=True)
 
 
+def _blf_size(font_id, size):
+    """blf.size dropped its dpi argument in Blender 4.0."""
+    if bpy.app.version >= (4, 0, 0):
+        blf.size(font_id, size)
+    else:
+        blf.size(font_id, size, 72)
+
+
+def draw_perf_hud(self, context):
+    """
+        Debug-only HUD (shown when log level is Debug): point count, query mode and frame timings.
+        Handy for recording before/after performance captures.
+    """
+    snapdata = self.snapdata_source if self.current_state == State.IDLE else self.snapdata_target
+    if snapdata is None:
+        return
+    mode = "numpy (no KDTree)" if getattr(snapdata, "use_numpy_query", False) else "KDTree"
+    lines = [
+        "QuickSnap perf",
+        f"points: {getattr(snapdata, 'added_points_np', 0):,}",
+        f"query mode: {mode}",
+        f"query: {getattr(snapdata, 'last_query_ms', 0.0):.2f} ms",
+        f"wire draw: {getattr(self, 'perf_wire_ms', 0.0):.2f} ms",
+        f"ingest total: {getattr(snapdata, 'processing_time_total', 0.0):.2f} s",
+    ]
+    font_id = 0
+    x = 20
+    y = context.region.height - 40
+    blf.color(font_id, 1, 1, 1, 1)
+    _blf_size(font_id, 16)
+    for line in lines:
+        blf.position(font_id, x, y, 0)
+        blf.draw(font_id, line)
+        y -= 22
+
+
 def draw_line_3d_smooth_blend(source, target, color_a=(1, 0, 0, 1), color_b=(0, 1, 0, 1), line_width=1,
                               depth_test=False):
     """
@@ -320,6 +357,8 @@ def draw_callback_2d(self, context):
     """
         Draw all QuickSnap 2D UI: Icons, source/target square. rubberband/
     """
+    if self.settings.log_level == 2:
+        draw_perf_hud(self, context)
     square_width=self.settings.selection_square_size
     current_time = time.time()
     if self.settings.snap_target_type_icon != 'NEVER' and current_time < self.icon_display_time + icon_display_duration or self.settings.snap_target_type_icon == 'ALWAYS':
@@ -475,8 +514,12 @@ def draw_callback_3d(self, context):
     if getattr(self, "local_wire_objects", None):
         wire_snapdata = self.snapdata_source if self.current_state == State.IDLE else self.snapdata_target
         if wire_snapdata is not None:
+            wire_start = time.perf_counter()
             for wire_object_name in list(self.local_wire_objects):
                 draw_local_wireframe(self, context, wire_snapdata, wire_object_name)
+            self.perf_wire_ms = (time.perf_counter() - wire_start) * 1000.0
+    else:
+        self.perf_wire_ms = 0.0
     if self.current_state == State.IDLE and not (self.object_mode and self.no_selection):
         coords = [self.snapdata_source.world_space[objectid] for objectid in self.snapdata_source.origins_map]
     else:

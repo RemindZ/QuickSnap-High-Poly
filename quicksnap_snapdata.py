@@ -272,6 +272,9 @@ class SnapData:
         # (object points always; origins only when add_to_kd is set).
         self.in_query = np.zeros(max_vertex_count, dtype=bool)
         self.added_points_np = 0
+        # Optional perf counters for the debug HUD (log level = Debug).
+        self.processing_time_total = 0.0
+        self.last_query_ms = 0.0
 
         # figure out origin count
         if not self.is_origin_snapdata or self.no_selection:  # Add all scene origins
@@ -628,7 +631,7 @@ class SnapData:
         returns tuple:
          (Closest point ID, closest point distance to mouse, target object name, bool: is the point an object origin)
         """
-
+        query_start = time.perf_counter()
         if not len(self.region_2d) > 0:
             return None
         closest_point_data = None
@@ -709,6 +712,7 @@ class SnapData:
             # logger.debug(f"Closest id: {close_points[0][1]} - is origin: {close_points[0][1] in self.origins_map}")
             closest_point_data = (closest[1], closest[3], self.scene_meshes[self.object_id[close_points[0][1]]],
                                   closest[0][1] in self.origins_map, close_points[0][4])
+        self.last_query_ms = (time.perf_counter() - query_start) * 1000.0
         return closest_point_data
 
     def get_max_vertex_count(self, context, selected_objects, scene_objects):
