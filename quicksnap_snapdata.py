@@ -252,14 +252,12 @@ class SnapData:
         # Initialize kdtrees-target points nparray with correct size
         max_vertex_count = self.get_max_vertex_count(context, selected_meshes, scene_meshes)
 
-        # Heavy-mesh gate: above the threshold, skip building a KDTree over millions of points
-        # (the upfront stall + memory blowup) and use a vectorized screen-space range query instead.
-        # Light scenes keep the exact KDTree path. Origins always stay on the tiny kd_origins tree.
+        # Above the threshold, skip the KDTree (build stall + memory) and query screen coords with
+        # numpy instead. Light scenes keep the KDTree path; origins always use kd_origins.
         self.use_numpy_query = (max_vertex_count >= getattr(settings, "heavy_mesh_threshold", 500000)
                                 and getattr(settings, "optimize_heavy_meshes", True))
         if self.use_numpy_query:
-            # self.kd only needs to hold object origins + cursor in this mode (it is not queried for
-            # mesh points), so size it to a small safe upper bound instead of max_vertex_count.
+            # kd only holds origins + cursor here (mesh points are queried with numpy), so keep it small.
             origin_capacity = len(selected_meshes) + len(scene_meshes) + 2
             self.kd = mathutils.kdtree.KDTree(origin_capacity)
         else:
@@ -270,9 +268,8 @@ class SnapData:
         self.indices = np.empty(max_vertex_count, dtype=int)
         self.spline_index = np.empty(max_vertex_count, dtype=int)
         self.object_id = np.empty(max_vertex_count, dtype=int)
-        # Tracks which stored points participate in the (non-origin) closest-point query, mirroring
-        # which points the KDTree path would have inserted. Object points: always; origins: only
-        # when snap_objects_origin == 'ALWAYS' (same condition as add_to_kd in add_point).
+        # Which points the numpy query considers, mirroring what the KDTree path would insert
+        # (object points always; origins only when add_to_kd is set).
         self.in_query = np.zeros(max_vertex_count, dtype=bool)
         self.added_points_np = 0
 
@@ -545,8 +542,7 @@ class SnapData:
         If is not set, only balance the trees.
         """
         logger.debug(f"balance_tree - Source:{self.is_origin_snapdata}")
-        # In heavy-mesh mode the KDTree is not used for mesh points (find_closest queries the numpy
-        # arrays directly), so skip the O(N log N) insert/balance that causes the upfront stall.
+        # Heavy-mesh mode queries numpy directly, so skip the kd insert/balance (the upfront stall).
         if self.use_numpy_query:
             return
         if start_index is not None and end_index is not None:
@@ -653,8 +649,7 @@ class SnapData:
             weight_depth = 3
             weight_dist = 1
             if self.use_numpy_query:
-                # Heavy-mesh path: vectorized screen-space range query directly on region_2d,
-                # avoiding the KDTree build entirely. Scoring matches the KDTree path exactly.
+                # Heavy-mesh path: range query on region_2d with numpy, same scoring as the kd path.
                 n = self.added_points_np
                 if n > 0:
                     coords = self.region_2d[:n]

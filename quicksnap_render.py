@@ -145,9 +145,7 @@ def draw_line_3d(source, target, color=(1, 1, 0, 1), line_width=1, depth_test=Fa
 
 def draw_lines_3d(coords, color=(1, 1, 0, 1), line_width=1, depth_test=False):
     """
-        Draw many 3d line segments as a single LINES batch.
-        `coords` is a flat sequence of point pairs: [a0, b0, a1, b1, ...] (each point a 3-sequence).
-        Used by the cursor-local wireframe to draw one batch per frame instead of one call per edge.
+        Draw many 3d line segments in a single LINES batch. coords is a flat list of point pairs.
     """
     if coords is None or len(coords) == 0:
         return
@@ -171,16 +169,9 @@ def draw_lines_3d(coords, color=(1, 1, 0, 1), line_width=1, depth_test=False):
 
 def build_local_wire_cache(self, context, snapdata, object_name):
     """
-    Build (once per view) the per-object data needed to draw the cursor-local wireframe:
-    full-length vertex world coords, vertex screen coords, and the edge->vertex-pair array.
-
-    This is self-contained: it projects ALL of the object's vertices itself rather than reusing
-    the snap ingestion, so (a) it works for every snap type (Vertices / Edge mid-points / Face
-    centers / Origins), and (b) it has world coords for every endpoint - including vertices off
-    screen or behind the camera - so an edge with one endpoint near the cursor is drawn in full,
-    even across large flat faces. Cached on self.local_wire_data and invalidated when the view
-    matrix changes (the cache is dropped in init_snap_data, and also re-checked against the
-    perspective matrix here). Returns the cache dict, or None when a wire cannot be built.
+        Build and cache the per-view vertex world/screen coords and edge list for the cursor-local
+        wireframe. Projects all of the object's verts (so it works for any snap type and has coords
+        for off-screen endpoints). Cached until the view matrix changes. Returns None if no wire.
     """
     obj = bpy.data.objects.get(object_name)
     if obj is None or obj.type != 'MESH':
@@ -188,10 +179,9 @@ def build_local_wire_cache(self, context, snapdata, object_name):
 
     cache = self.local_wire_data.get(object_name)
     if cache is not None and cache.get("matrix") == snapdata.perspective_matrix:
-        return cache  # Still valid for the current view.
+        return cache
 
-    # Use the same mesh data (evaluated or raw) that snap ingestion used, so the wireframe matches
-    # the mesh that is actually snappable. Mirrors the evaluated/raw selection in add_object_data.
+    # Same evaluated/raw data choice as add_object_data, so the wire matches the snappable mesh.
     is_selected = object_name in self.selection_objects
     if is_selected:
         use_evaluated = self.object_mode and not self.settings.ignore_modifiers
@@ -207,8 +197,7 @@ def build_local_wire_cache(self, context, snapdata, object_name):
     if n_verts == 0 or n_edges == 0:
         return None
 
-    # Object-space vertex coords -> world space (kept for drawing) -> screen space (for the
-    # near-cursor test). Same projection math as ObjectPointData.
+    # Object space -> world (for drawing) -> screen (for the near-cursor test). Same math as ObjectPointData.
     co = np.empty(n_verts * 3, dtype=np.float64)
     data.vertices.foreach_get('co', co)
     co.shape = (n_verts, 3)
@@ -223,7 +212,7 @@ def build_local_wire_cache(self, context, snapdata, object_name):
         sx = snapdata.width_half + (proj[:, 0] / w) * snapdata.width_half
         sy = snapdata.height_half + (proj[:, 1] / w) * snapdata.height_half
     vert_screen = np.column_stack((sx, sy))
-    vert_screen[w <= 0] = np.inf  # Behind the camera -> never counts as near the cursor.
+    vert_screen[w <= 0] = np.inf  # Behind camera: never near the cursor.
 
     edge_verts = np.zeros(n_edges * 2, dtype=np.int64)
     data.edges.foreach_get('vertices', edge_verts)
@@ -241,10 +230,8 @@ def build_local_wire_cache(self, context, snapdata, object_name):
 
 def draw_local_wireframe(self, context, snapdata, object_name, color=(0.7, 0.7, 0.7, 0.5)):
     """
-    Draw a wireframe limited to the mesh edges near the cursor, for heavy objects where the native
-    show_wire overlay is too expensive. Per frame this only masks edges by screen distance to the
-    mouse (vectorized numpy) and draws a single LINES batch. An edge is drawn whenever EITHER
-    endpoint is within the radius, so edges spanning large flat faces are drawn in full.
+        Draw the mesh edges near the cursor for heavy objects (cheaper than the native show_wire).
+        An edge is drawn if either endpoint is within the radius, so long edges are drawn in full.
     """
     cache = build_local_wire_cache(self, context, snapdata, object_name)
     if cache is None:
@@ -255,7 +242,7 @@ def draw_local_wireframe(self, context, snapdata, object_name, color=(0.7, 0.7, 
     vert_screen = cache["vert_screen"]
     dx = vert_screen[:, 0] - mouse_x
     dy = vert_screen[:, 1] - mouse_y
-    near = (dx * dx + dy * dy) < (radius * radius)  # inf coords (behind camera) compare False.
+    near = (dx * dx + dy * dy) < (radius * radius)
 
     edge_verts = cache["edge_verts"]
     a = edge_verts[:, 0]
@@ -270,8 +257,7 @@ def draw_local_wireframe(self, context, snapdata, object_name, color=(0.7, 0.7, 
     coords[0::2] = vert_world[selected[:, 0]]
     coords[1::2] = vert_world[selected[:, 1]]
 
-    # Apply the camera offset only to this small near-cursor subset (cheap per frame), to avoid
-    # z-fighting with the solid mesh - matches the look of the existing edge highlight.
+    # Offset the (small) near-cursor subset towards the camera to avoid z-fighting, like the edge highlight.
     region3d = context.space_data.region_3d
     camera_position = np.array(region3d.view_matrix.inverted().translation, dtype=np.float64)
     cam_to = camera_position[None, :] - coords
@@ -485,7 +471,7 @@ def draw_callback_3d(self, context):
         Draw all 3D ui for QuickSnap: Snap axis, edge/points highlight.
     """
     draw_snap_axis(self, context)
-    # Cursor-local wireframe for heavy objects (replaces the native show_wire overlay).
+    # Cursor-local wireframe for heavy objects (instead of native show_wire).
     if getattr(self, "local_wire_objects", None):
         wire_snapdata = self.snapdata_source if self.current_state == State.IDLE else self.snapdata_target
         if wire_snapdata is not None:

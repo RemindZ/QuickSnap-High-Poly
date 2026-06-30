@@ -151,8 +151,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
                                                               bpy.data.objects[object_name].display_bounds_type)
 
     def revert_object_display(self, object_name):
-        # Clear the cursor-local wireframe flag in the same place native display is reverted, so
-        # nothing persists after the operator exits.
+        # Clear the local-wire flag alongside the native display revert.
         self.local_wire_objects.discard(object_name)
         if object_name in self.target_object_display_backup:
             (bpy.data.objects[object_name].show_wire,
@@ -190,9 +189,8 @@ class QuickVertexSnapOperator(bpy.types.Operator):
 
     def _apply_wireframe_display(self, object_name):
         """
-        Enable a wireframe overlay for the target/hover object. For heavy meshes, skip the native
-        all-edges show_wire (the dominant sustained cost) and flag the object for the cursor-local
-        wireframe drawn in draw_callback_3d. Light meshes keep the native overlay exactly as before.
+        Show the target/hover wireframe. Heavy meshes skip the native show_wire (too slow) and use
+        the cursor-local wireframe instead; light meshes keep show_wire.
         """
         if quicksnap_utils.is_heavy_object(bpy.data.objects[object_name], self.settings):
             self.local_wire_objects.add(object_name)
@@ -461,14 +459,8 @@ class QuickVertexSnapOperator(bpy.types.Operator):
     def refresh_vertex_data(self, context, region):
         """
         Re-Init the snapdata if the view camera moved. (Updates 2d positions of all points)
-
-        Screen-space projection is a function of the view/perspective matrix only, never of the
-        mouse. This guard is the projection cache: it compares the current view matrix, perspective
-        matrix, view distance and camera zoom against the snapshot taken when the SnapData was last
-        built, and bails out when they are unchanged. On a mouse-move-only frame nothing here runs,
-        so no point gets re-projected - only the closest-point query (in update()) executes.
-        Invalidation fires on any orbit/pan/zoom (including between the two clicks of the workflow),
-        because those change the view matrix and therefore camera_position/perspective_matrix below.
+        Projection only depends on the view, so on a mouse-move-only frame this bails out and
+        nothing gets re-projected. Orbit/pan/zoom change the matrix below and trigger a rebuild.
         """
         region3d = context.space_data.region_3d
         if self.camera_position == region3d.view_matrix.inverted().translation \
@@ -822,8 +814,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         pass
 
     def init_snap_data(self, context, region, revert_source, revert_target):
-        # The local-wire cache is keyed to the (now stale) ObjectPointData instances; drop it so it
-        # rebuilds against the new projection.
+        # Drop the local-wire cache so it rebuilds against the new projection.
         self.local_wire_data = {}
         if revert_source:
             self.snapdata_source.__init__(context, region, self.settings, self.selection_objects,
@@ -913,11 +904,7 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
                                                             , default=True)
     ignore_modifiers: bpy.props.BoolProperty(name="Ignore modifiers (For heavy scenes)", default=False)
 
-    # ---------------------------------------------------------------------------------------------
-    # High-poly performance settings.
-    # These gate the heavy-mesh optimization paths (cursor-local wireframe + localized numpy query).
-    # Light meshes (below the threshold) keep the original behavior exactly.
-    # ---------------------------------------------------------------------------------------------
+    # High-poly settings. Gate the heavy-mesh paths; meshes below the threshold are unchanged.
     optimize_heavy_meshes: bpy.props.BoolProperty(
         name="Optimize high-poly meshes",
         description="Enable the high-poly optimization paths for objects above the vertex threshold:"

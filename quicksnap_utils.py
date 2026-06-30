@@ -135,10 +135,7 @@ def get_addon_settings():
 
 
 def get_object_vertex_count(obj):
-    """
-    Returns an approximate snappable-vertex count for an object, used to gate the heavy-mesh
-    optimization paths. Cheap (just len() on the mesh data), so safe to call per object.
-    """
+    """Vertex count used to gate the heavy-mesh paths. Cheap, safe to call per object."""
     if obj is None:
         return 0
     if obj.type == 'MESH':
@@ -147,11 +144,7 @@ def get_object_vertex_count(obj):
 
 
 def is_heavy_object(obj, settings=None):
-    """
-    Returns True when the object should use the heavy-mesh optimization paths (cursor-local
-    wireframe, localized numpy query). Gated on the user-configurable vertex threshold so that
-    light meshes keep the exact same behavior as before.
-    """
+    """True if the object is above the (user-set) vertex threshold and should use the heavy paths."""
     if settings is None:
         settings = get_addon_settings()
     if settings is None or not getattr(settings, "optimize_heavy_meshes", True):
