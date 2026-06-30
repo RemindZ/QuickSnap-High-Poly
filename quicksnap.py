@@ -930,6 +930,13 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
         description="Pixel radius around the cursor for the high-poly cursor-local wireframe."
                     " A bit larger than the snap radius so the wire reads as context",
         default=60, min=10, max=400)
+    local_wireframe_color: bpy.props.FloatVectorProperty(
+        name="Cursor wireframe color",
+        subtype='COLOR',
+        default=(1.0, 1.0, 1.0),
+        min=0.0, max=1.0)
+    local_wireframe_opacity: bpy.props.FloatProperty(
+        name="Cursor wireframe opacity", default=0.9, min=0.0, max=1.0)
 
     snap_source_type: bpy.props.EnumProperty(
         name="Snap From",
@@ -1011,6 +1018,8 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
         if self.optimize_heavy_meshes:
             heavy_box.prop(self, "heavy_mesh_threshold")
             heavy_box.prop(self, "local_wireframe_radius")
+            heavy_box.prop(self, "local_wireframe_color")
+            heavy_box.prop(self, "local_wireframe_opacity")
         col.prop(self, "snap_objects_origin")
         col.prop(self, "draw_rubberband")
         col.prop(self, "display_target_wireframe")

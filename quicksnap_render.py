@@ -229,7 +229,7 @@ def build_local_wire_cache(self, context, snapdata, object_name):
     return cache
 
 
-def draw_local_wireframe(self, context, snapdata, object_name, color=(0.7, 0.7, 0.7, 0.5)):
+def draw_local_wireframe(self, context, snapdata, object_name):
     """
         Draw the mesh edges near the cursor for heavy objects (cheaper than the native show_wire).
         An edge is drawn if either endpoint is within the radius, so long edges are drawn in full.
@@ -237,6 +237,7 @@ def draw_local_wireframe(self, context, snapdata, object_name, color=(0.7, 0.7, 
     cache = build_local_wire_cache(self, context, snapdata, object_name)
     if cache is None:
         return
+    color = (*self.settings.local_wireframe_color, self.settings.local_wireframe_opacity)
 
     radius = self.settings.local_wireframe_radius
     mouse_x, mouse_y = self.mouse_position[0], self.mouse_position[1]
