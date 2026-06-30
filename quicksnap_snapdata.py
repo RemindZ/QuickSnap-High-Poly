@@ -275,6 +275,15 @@ class SnapData:
         # Optional perf counters for the debug HUD (log level = Debug).
         self.processing_time_total = 0.0
         self.last_query_ms = 0.0
+        # Screen-space grid for the heavy-mesh query (built lazily once ingestion is idle), so the
+        # per-frame lookup only touches points near the cursor instead of scanning every point.
+        self._grid_cell = 20
+        self._grid_count = -1
+        self._grid_cell_id_sorted = None
+        self._grid_point_idx = None
+        self._grid_ncols = 0
+        self._grid_min_x = 0
+        self._grid_min_y = 0
 
         # figure out origin count
         if not self.is_origin_snapdata or self.no_selection:  # Add all scene origins
@@ -625,6 +634,56 @@ class SnapData:
                 bpy.data.objects[selected_object].select_set(True)
         return False
 
+    def _build_screen_grid(self, n):
+        """Bin the queryable points into a screen-space grid (cell = search radius) for fast lookups."""
+        idxs = np.nonzero(self.in_query[:n])[0]
+        if len(idxs) == 0:
+            self._grid_cell_id_sorted = np.empty(0, dtype=np.int64)
+            self._grid_point_idx = np.empty(0, dtype=np.int64)
+            self._grid_ncols = 1
+            self._grid_count = n
+            return
+        pts = self.region_2d[idxs, :2]
+        cell = self._grid_cell
+        cx = np.floor(pts[:, 0] / cell).astype(np.int64)
+        cy = np.floor(pts[:, 1] / cell).astype(np.int64)
+        self._grid_min_x = int(cx.min())
+        self._grid_min_y = int(cy.min())
+        cx -= self._grid_min_x
+        cy -= self._grid_min_y
+        self._grid_ncols = int(cx.max()) + 1
+        cell_id = cy * self._grid_ncols + cx
+        order = np.argsort(cell_id, kind='stable')
+        self._grid_cell_id_sorted = cell_id[order]
+        self._grid_point_idx = idxs[order]
+        self._grid_count = n
+
+    def _grid_candidates(self, mouse_x, mouse_y):
+        """Return region_2d indices held in the 3x3 grid cells around the mouse (None if empty)."""
+        if self._grid_point_idx is None or len(self._grid_point_idx) == 0:
+            return None
+        cell = self._grid_cell
+        ncols = self._grid_ncols
+        mcx = int(np.floor(mouse_x / cell)) - self._grid_min_x
+        mcy = int(np.floor(mouse_y / cell)) - self._grid_min_y
+        chunks = []
+        for dy in (-1, 0, 1):
+            cyy = mcy + dy
+            if cyy < 0:
+                continue
+            for dx in (-1, 0, 1):
+                cxx = mcx + dx
+                if cxx < 0 or cxx >= ncols:
+                    continue
+                cell_id = cyy * ncols + cxx
+                lo = np.searchsorted(self._grid_cell_id_sorted, cell_id, side='left')
+                hi = np.searchsorted(self._grid_cell_id_sorted, cell_id, side='right')
+                if hi > lo:
+                    chunks.append(self._grid_point_idx[lo:hi])
+        if not chunks:
+            return None
+        return np.concatenate(chunks)
+
     def find_closest(self, mouse_coord_screen_flat, search_origins_only=False):
         """
         Returns the closest point to mouse cursor amongst SnapData's points
@@ -652,21 +711,43 @@ class SnapData:
             weight_depth = 3
             weight_dist = 1
             if self.use_numpy_query:
-                # Heavy-mesh path: range query on region_2d with numpy, same scoring as the kd path.
+                # Heavy-mesh path: same scoring as the kd path, but only over points near the cursor.
                 n = self.added_points_np
                 if n > 0:
-                    coords = self.region_2d[:n]
-                    dx = coords[:, 0] - mouse_coord_screen_flat[0]
-                    dy = coords[:, 1] - mouse_coord_screen_flat[1]
-                    d2 = dx * dx + dy * dy
-                    mask = (d2 < search_distance * search_distance) & self.in_query[:n]
-                    found_idx = np.nonzero(mask)[0]
+                    mouse_x = mouse_coord_screen_flat[0]
+                    mouse_y = mouse_coord_screen_flat[1]
+                    r2 = search_distance * search_distance
+                    if len(self.to_process_selected) == 0 and len(self.to_process_scene) == 0:
+                        # Ingestion idle: use the cached screen-space grid (only near-cursor cells).
+                        if self._grid_count != n:
+                            self._build_screen_grid(n)
+                        candidates = self._grid_candidates(mouse_x, mouse_y)
+                        if candidates is None:
+                            found_idx = np.empty(0, dtype=np.int64)
+                            found_d2 = np.empty(0, dtype=np.float64)
+                        else:
+                            cand_co = self.region_2d[candidates]
+                            cdx = cand_co[:, 0] - mouse_x
+                            cdy = cand_co[:, 1] - mouse_y
+                            cand_d2 = cdx * cdx + cdy * cdy
+                            within = cand_d2 < r2
+                            found_idx = candidates[within]
+                            found_d2 = cand_d2[within]
+                    else:
+                        # Still ingesting: scan the points added so far.
+                        coords = self.region_2d[:n]
+                        dx = coords[:, 0] - mouse_x
+                        dy = coords[:, 1] - mouse_y
+                        d2 = dx * dx + dy * dy
+                        mask = (d2 < r2) & self.in_query[:n]
+                        found_idx = np.nonzero(mask)[0]
+                        found_d2 = d2[found_idx]
                     if len(found_idx) > 0:
-                        dists = np.sqrt(d2[found_idx])
+                        dists = np.sqrt(found_d2)
                         dist = dists / search_distance
 
                         # Depth was multiplied by 10e-8 so it would not affect the kdtree search.
-                        depth = coords[found_idx, 2] * 100000000
+                        depth = self.region_2d[found_idx, 2] * 100000000
                         depth = depth / np.amax(depth)  # Normalized depth
 
                         score = (depth * weight_depth + dist * weight_dist + dist * depth) / (
