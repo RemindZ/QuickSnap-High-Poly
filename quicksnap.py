@@ -937,6 +937,11 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
         min=0.0, max=1.0)
     local_wireframe_opacity: bpy.props.FloatProperty(
         name="Cursor wireframe opacity", default=0.9, min=0.0, max=1.0)
+    local_wireframe_xray: bpy.props.BoolProperty(
+        name="Wireframe through geometry (x-ray)",
+        description="Draw the cursor wireframe through the mesh. Off (default) shows only the edges"
+                    " on the surface you are looking at; on also shows edges on the far side",
+        default=False)
 
     snap_source_type: bpy.props.EnumProperty(
         name="Snap From",
@@ -1020,6 +1025,7 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
             heavy_box.prop(self, "local_wireframe_radius")
             heavy_box.prop(self, "local_wireframe_color")
             heavy_box.prop(self, "local_wireframe_opacity")
+            heavy_box.prop(self, "local_wireframe_xray")
         col.prop(self, "snap_objects_origin")
         col.prop(self, "draw_rubberband")
         col.prop(self, "display_target_wireframe")

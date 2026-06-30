@@ -259,9 +259,21 @@ def draw_local_wireframe(self, context, snapdata, object_name):
     coords[0::2] = vert_world[selected[:, 0]]
     coords[1::2] = vert_world[selected[:, 1]]
 
-    # No depth test: draw the wire over the solid mesh so verts hidden behind other geometry stay
-    # visible (QuickSnap can snap to non-visible points). Same in both snapping phases.
-    draw_lines_3d(coords.astype(np.float32).tolist(), color=color, line_width=1, depth_test=False)
+    # Depth test (default) hides the far side so only the surface you see is wireframed; x-ray draws
+    # through. When depth testing, nudge the verts towards the camera to avoid z-fighting the surface.
+    depth_test = not self.settings.local_wireframe_xray
+    if depth_test:
+        region3d = context.space_data.region_3d
+        camera_position = np.array(region3d.view_matrix.inverted().translation, dtype=np.float64)
+        cam_to = camera_position[None, :] - coords
+        if not region3d.is_perspective:
+            camera_vector = np.array(region3d.view_rotation @ Vector((0.0, 0.0, -1.0)), dtype=np.float64)
+            dist = np.sqrt(np.einsum('ij,ij->i', cam_to, cam_to))
+            coords = coords - camera_vector[None, :] * dist[:, None] * 0.01
+        else:
+            coords = coords + cam_to * 0.01
+
+    draw_lines_3d(coords.astype(np.float32).tolist(), color=color, line_width=1, depth_test=depth_test)
 
 
 def _blf_size(font_id, size):
