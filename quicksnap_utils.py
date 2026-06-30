@@ -149,7 +149,7 @@ def is_heavy_object(obj, settings=None):
         settings = get_addon_settings()
     if settings is None or not getattr(settings, "optimize_heavy_meshes", True):
         return False
-    return get_object_vertex_count(obj) >= settings.heavy_mesh_threshold
+    return get_object_vertex_count(obj) >= settings.heavy_mesh_threshold * 1000
 
 
 def get_axis_target(origin, target, axis_constraint, obj=None):

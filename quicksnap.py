@@ -920,10 +920,11 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
                     " localized point query instead of building a KDTree over millions of points",
         default=True)
     heavy_mesh_threshold: bpy.props.IntProperty(
-        name="High-poly vertex threshold",
-        description="Objects with at least this many vertices use the optimized high-poly paths."
-                    " Meshes below this count keep the original behavior",
-        default=500000, min=1000, soft_max=10000000)
+        name="High-poly vertex threshold (x1000)",
+        description="Objects with at least this many thousand vertices use the optimized high-poly"
+                    " paths. Meshes below this count keep the original behavior. Example: 500 = 500,000"
+                    " vertices",
+        default=500, min=1, soft_max=20000, step=10)
     local_wireframe_radius: bpy.props.IntProperty(
         name="Cursor wireframe radius (px)",
         description="Pixel radius around the cursor for the high-poly cursor-local wireframe."

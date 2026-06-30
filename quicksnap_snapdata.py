@@ -254,7 +254,7 @@ class SnapData:
 
         # Above the threshold, skip the KDTree (build stall + memory) and query screen coords with
         # numpy instead. Light scenes keep the KDTree path; origins always use kd_origins.
-        self.use_numpy_query = (max_vertex_count >= getattr(settings, "heavy_mesh_threshold", 500000)
+        self.use_numpy_query = (max_vertex_count >= getattr(settings, "heavy_mesh_threshold", 500) * 1000
                                 and getattr(settings, "optimize_heavy_meshes", True))
         if self.use_numpy_query:
             # kd only holds origins + cursor here (mesh points are queried with numpy), so keep it small.
