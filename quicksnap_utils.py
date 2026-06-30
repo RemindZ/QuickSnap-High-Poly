@@ -134,22 +134,31 @@ def get_addon_settings():
     return None
 
 
-def get_object_vertex_count(obj):
-    """Vertex count used to gate the heavy-mesh paths. Cheap, safe to call per object."""
-    if obj is None:
+def get_object_vertex_count(obj, depsgraph=None):
+    """
+    Vertex count used to gate the heavy-mesh paths. With a depsgraph and modifiers, returns the
+    evaluated (displayed) count so subsurf/multires sculpts gate the same way they are ingested.
+    """
+    if obj is None or obj.type != 'MESH':
         return 0
-    if obj.type == 'MESH':
-        return len(obj.data.vertices)
-    return 0
+    if depsgraph is not None and len(obj.modifiers) > 0:
+        try:
+            return len(obj.evaluated_get(depsgraph).data.vertices)
+        except (RuntimeError, AttributeError):
+            pass
+    return len(obj.data.vertices)
 
 
-def is_heavy_object(obj, settings=None):
+def is_heavy_object(obj, settings=None, depsgraph=None):
     """True if the object is above the (user-set) vertex threshold and should use the heavy paths."""
     if settings is None:
         settings = get_addon_settings()
     if settings is None or not getattr(settings, "optimize_heavy_meshes", True):
         return False
-    return get_object_vertex_count(obj) >= settings.heavy_mesh_threshold * 1000
+    # Match ingestion: count evaluated verts unless modifiers are ignored.
+    if getattr(settings, "ignore_modifiers", False):
+        depsgraph = None
+    return get_object_vertex_count(obj, depsgraph) >= settings.heavy_mesh_threshold * 1000
 
 
 def get_axis_target(origin, target, axis_constraint, obj=None):

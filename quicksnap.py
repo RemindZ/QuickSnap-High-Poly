@@ -193,7 +193,8 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         Show the target/hover wireframe. Heavy meshes skip the native show_wire (too slow) and use
         the cursor-local wireframe instead; light meshes keep show_wire.
         """
-        if quicksnap_utils.is_heavy_object(bpy.data.objects[object_name], self.settings):
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        if quicksnap_utils.is_heavy_object(bpy.data.objects[object_name], self.settings, depsgraph):
             self.local_wire_objects.add(object_name)
         else:
             bpy.data.objects[object_name].show_wire = True
