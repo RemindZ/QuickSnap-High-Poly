@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.5.1
+
+### Added
+- Post-snap precision fit (object mode, toggleable, on by default): after a snap
+  confirms, the selection is nudged (translation only, no rotation) so the
+  geometry around the snapped point seats onto the target surface. Intended for
+  assembling kit parts where peg and hole vertices do not correspond exactly.
+  - Sampling is anchored to the snapped point, matches are only accepted near
+    the contact area and between surfaces facing each other, so complex
+    geometry around the mating features does not affect the fit.
+  - The correction is capped relative to the sampled area, applied within the
+    same undo step, and skipped when an axis constraint is active or the target
+    is an origin/cursor/free-space point.
+  - New preferences under "Precision fit": enable toggle and sample count.
+
 ## 1.5.0
 
 High-poly performance pass. The tool stays usable on objects in the
