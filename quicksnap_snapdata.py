@@ -692,6 +692,7 @@ class SnapData:
         """
         query_start = time.perf_counter()
         if not len(self.region_2d) > 0:
+            self.last_query_ms = 0.0
             return None
         closest_point_data = None
         close_points = []
