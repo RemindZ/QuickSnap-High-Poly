@@ -161,6 +161,134 @@ def is_heavy_object(obj, settings=None, depsgraph=None):
     return get_object_vertex_count(obj, depsgraph) >= settings.heavy_mesh_threshold * 1000
 
 
+def compute_precision_fit(context, settings, object_names, target_object_name, contact_point,
+                          sample_count=300, iterations=8):
+    """
+    Post-snap refinement: translation-only ICP between the moving objects' vertices around the
+    snapped point and the target mesh surface. Sampling is anchored to the snapped point (the peg),
+    matches are kept only near the contact area (the hole) and only between surfaces facing each
+    other, so complex geometry around the mating features does not pull the fit.
+    Returns a world-space correction Vector, or None when there is nothing reliable to fit.
+    """
+    target_obj = bpy.data.objects.get(target_object_name)
+    if target_obj is None or target_obj.type != 'MESH':
+        return None
+    depsgraph = context.evaluated_depsgraph_get()
+    target_eval = target_obj if settings.ignore_modifiers else target_obj.evaluated_get(depsgraph)
+    if len(target_eval.data.polygons) == 0:
+        return None
+
+    contact = np.array(contact_point, dtype=np.float64)
+
+    # Sample vertices of the moving objects, nearest to the snapped point, with world normals.
+    sample_co = []
+    sample_no = []
+    sample_d2 = []
+    for name in object_names:
+        obj = bpy.data.objects.get(name)
+        if obj is None or obj.type != 'MESH':
+            continue
+        data_obj = obj if settings.ignore_modifiers else obj.evaluated_get(depsgraph)
+        data = data_obj.data
+        count = len(data.vertices)
+        if count == 0:
+            continue
+        co = np.empty(count * 3, dtype=np.float64)
+        data.vertices.foreach_get('co', co)
+        co.shape = (count, 3)
+        matrix = np.array(data_obj.matrix_world, dtype=np.float64)
+        world = co @ matrix[:3, :3].T + matrix[:3, 3]
+        d2 = ((world - contact) ** 2).sum(axis=1)
+        keep = min(sample_count, count)
+        sel = np.argpartition(d2, keep - 1)[:keep]
+        normals = np.empty((keep, 3), dtype=np.float64)
+        verts = data.vertices
+        for i, vid in enumerate(sel):
+            normals[i] = verts[int(vid)].normal[:]
+        normals = normals @ matrix[:3, :3].T
+        lengths = np.linalg.norm(normals, axis=1)
+        lengths[lengths == 0] = 1
+        sample_co.append(world[sel])
+        sample_no.append(normals / lengths[:, None])
+        sample_d2.append(d2[sel])
+    if not sample_co:
+        return None
+    points = np.concatenate(sample_co)
+    point_normals = np.concatenate(sample_no)
+    d2 = np.concatenate(sample_d2)
+    if len(points) > sample_count:
+        sel = np.argpartition(d2, sample_count - 1)[:sample_count]
+        points, point_normals, d2 = points[sel], point_normals[sel], d2[sel]
+    if len(points) < 16:
+        return None
+    sample_radius = float(np.sqrt(d2.max()))
+    if sample_radius <= 0:
+        return None
+
+    matrix_t = np.array(target_obj.matrix_world, dtype=np.float64)
+    inv_t = np.array(target_obj.matrix_world.inverted(), dtype=np.float64)
+    # Approximate world->local scale, to express search distances in the target's local space.
+    inv_scale = float(np.mean(np.linalg.norm(inv_t[:3, :3], axis=0)))
+    search_local = 2.0 * sample_radius * inv_scale
+
+    max_correction = 0.75 * sample_radius
+    total = np.zeros(3)
+    closest = target_eval.closest_point_on_mesh
+    for _ in range(iterations):
+        local = (points + total) @ inv_t[:3, :3].T + inv_t[:3, 3]
+        q = np.empty_like(points)
+        qn = np.empty_like(points)
+        found_mask = np.zeros(len(points), dtype=bool)
+        for i in range(len(points)):
+            found, location, normal, _ = closest(Vector(local[i]), distance=search_local)
+            if found:
+                q[i] = location[:]
+                qn[i] = normal[:]
+                found_mask[i] = True
+        if found_mask.sum() < 8:
+            break
+        qw = q[found_mask] @ matrix_t[:3, :3].T + matrix_t[:3, 3]
+        qnw = qn[found_mask] @ matrix_t[:3, :3].T
+        lengths = np.linalg.norm(qnw, axis=1)
+        lengths[lengths == 0] = 1
+        qnw /= lengths[:, None]
+        pw = points[found_mask] + total
+        pnw = point_normals[found_mask]
+
+        # Stay on the mating features: matches must be near the contact and roughly facing us.
+        keep = ((qw - contact) ** 2).sum(axis=1) < (1.5 * sample_radius) ** 2
+        keep &= (pnw * qnw).sum(axis=1) < 0.2
+        if keep.sum() < 8:
+            break
+        pw, qw, qnw = pw[keep], qw[keep], qnw[keep]
+
+        # Point-to-plane errors, with outlier trimming. The trim keeps an absolute floor: when most
+        # surfaces already touch (median error near zero) the few matches carrying the real offset,
+        # e.g. the floor contact of a straight peg, must not be discarded as outliers.
+        err = ((pw - qw) * qnw).sum(axis=1)
+        med = np.median(np.abs(err))
+        trim = np.abs(err) <= max(3.0 * med, 0.15 * sample_radius)
+        if trim.sum() < 8:
+            break
+        e = err[trim]
+        n = qnw[trim]
+
+        # Damped least squares: unconstrained axes stay put instead of drifting.
+        a = n.T @ n
+        a += np.eye(3) * max(1e-4 * np.trace(a) / 3.0, 1e-12)
+        step = np.linalg.solve(a, -(n * e[:, None]).sum(axis=0))
+        total += step
+        dist = float(np.linalg.norm(total))
+        if dist > max_correction:
+            total *= max_correction / dist
+            break
+        if float(np.linalg.norm(step)) < 1e-4 * sample_radius:
+            break
+    if float(np.linalg.norm(total)) < 1e-9:
+        return None
+    return Vector(total)
+
+
 def get_axis_target(origin, target, axis_constraint, obj=None):
     """
     Returns the snapping target taking into account constrain options

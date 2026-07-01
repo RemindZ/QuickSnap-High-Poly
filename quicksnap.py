@@ -207,6 +207,36 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         else:
             bpy.data.objects[object_name].show_wire = True
 
+    def run_precision_fit(self, context):
+        """
+        Optional post-snap refinement (object mode): nudge the selection so the geometry around the
+        snapped point seats onto the target surface. Translation only, runs once on confirm.
+        Skipped with axis constraints (it would break them) and origin/cursor/free-space targets.
+        """
+        if not getattr(self.settings, "precision_fit", False):
+            return
+        if not self.object_mode or len(self.snapping) > 0:
+            return
+        if self.closest_target_id < 0 or self.target is None or self.target_object == "":
+            return
+        if self.closest_target_id in self.snapdata_target.origins_map:
+            return
+        try:
+            fit = quicksnap_utils.compute_precision_fit(context, self.settings, self.selection_objects,
+                                                        self.target_object, self.target,
+                                                        sample_count=self.settings.precision_fit_samples)
+        except Exception as error:
+            logger.warning(f"Precision fit skipped: {error}")
+            return
+        if fit is None:
+            return
+        if self.last_translation is not None:
+            self.last_translation = self.last_translation + fit
+        bpy.ops.transform.translate(value=fit, orient_type='GLOBAL', snap=False,
+                                    use_automerge_and_split=False)
+        logger.info(f"Precision fit: corrected by {fit.length:.6f}")
+        self.report({'INFO'}, f"QuickSnap precision fit: {fit.length:.4f}")
+
     def revert_data(self, context, apply=False):
         """
         Revert the backed up data (verts/curve points positions if in EDIT mode, objects locations if in OBJECT mode)
@@ -564,6 +594,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
             elif event.value == 'PRESS' or self.clickdrag:  # Disable the tool on mouse release if click dragging.
                 # Last translation for applying auto-merge
                 self.apply(context, region, use_auto_merge=self.settings.use_auto_merge)
+                self.run_precision_fit(context)
                 self.terminate(context)
                 return {'FINISHED'}
 
@@ -960,6 +991,20 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
                     " on the surface you are looking at; on also shows edges on the far side",
         default=False)
 
+    # Post-snap precision fit (object mode).
+    precision_fit: bpy.props.BoolProperty(
+        name="Post-snap precision fit (object mode)",
+        description="After snapping, nudge the selection (translation only, no rotation) so the"
+                    " geometry around the snapped point seats onto the target surface. Useful for"
+                    " pegs/holes whose vertices do not correspond exactly. Skipped when an axis"
+                    " constraint is active",
+        default=True)
+    precision_fit_samples: bpy.props.IntProperty(
+        name="Fit samples",
+        description="How many vertices around the snapped point are matched against the target"
+                    " surface when fitting",
+        default=300, min=50, max=2000)
+
     snap_source_type: bpy.props.EnumProperty(
         name="Snap From",
         items=[
@@ -1043,6 +1088,11 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
             heavy_box.prop(self, "local_wireframe_color")
             heavy_box.prop(self, "local_wireframe_opacity")
             heavy_box.prop(self, "local_wireframe_xray")
+        fit_box = col.box().column()
+        fit_box.label(text="Precision fit:")
+        fit_box.prop(self, "precision_fit")
+        if self.precision_fit:
+            fit_box.prop(self, "precision_fit_samples")
         col.prop(self, "snap_objects_origin")
         col.prop(self, "draw_rubberband")
         col.prop(self, "display_target_wireframe")
