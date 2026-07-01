@@ -168,19 +168,27 @@ def draw_lines_3d(coords, color=(1, 1, 0, 1), line_width=1, depth_test=False):
         gpu.state.depth_test_set("NONE")
 
 
-def build_local_wire_cache(self, context, snapdata, object_name):
+def _gather_ranges(starts, ends, values):
+    """Concatenate values[starts[i]:ends[i]] for all i, vectorized. Returns None when empty."""
+    lens = ends - starts
+    total = int(lens.sum())
+    if total == 0:
+        return None
+    cum = np.zeros(len(lens), dtype=np.int64)
+    np.cumsum(lens[:-1], out=cum[1:])
+    idx = np.arange(total, dtype=np.int64) - np.repeat(cum, lens) + np.repeat(starts, lens)
+    return values[idx]
+
+
+def _build_wire_static(self, context, object_name):
     """
-        Build and cache the per-view vertex world/screen coords and edge list for the cursor-local
-        wireframe. Projects all of the object's verts (so it works for any snap type and has coords
-        for off-screen endpoints). Cached until the view matrix changes. Returns None if no wire.
+        Fetch the per-object data for the cursor-local wireframe once: world-space vertex coords,
+        the edge list, and a vertex->edge adjacency (CSR) so per-frame lookups only touch edges
+        around the cursor. Kept until the operator ends or 'ignore modifiers' changes.
     """
     obj = bpy.data.objects.get(object_name)
     if obj is None or obj.type != 'MESH':
         return None
-
-    cache = self.local_wire_data.get(object_name)
-    if cache is not None and cache.get("matrix") == snapdata.perspective_matrix:
-        return cache
 
     # Same evaluated/raw data choice as add_object_data, so the wire matches the snappable mesh.
     is_selected = object_name in self.selection_objects
@@ -198,34 +206,142 @@ def build_local_wire_cache(self, context, snapdata, object_name):
     if n_verts == 0 or n_edges == 0:
         return None
 
-    # Object space -> world (for drawing) -> screen (for the near-cursor test). Same math as ObjectPointData.
     co = np.empty(n_verts * 3, dtype=np.float64)
     data.vertices.foreach_get('co', co)
     co.shape = (n_verts, 3)
-    homog = np.ones((n_verts, 4), dtype=np.float64)
-    homog[:, :3] = co
-    world_h = np.einsum('ij,aj->ai', np.array(obj.matrix_world), homog)
-    vert_world = world_h[:, :3]
+    matrix = np.array(obj.matrix_world, dtype=np.float64)
+    vert_world = (co @ matrix[:3, :3].T + matrix[:3, 3]).astype(np.float32)
 
-    proj = np.einsum('ij,aj->ai', np.array(snapdata.perspective_matrix), world_h)
-    w = proj[:, 3]
+    edge_verts = np.zeros(n_edges * 2, dtype=np.int32)
+    data.edges.foreach_get('vertices', edge_verts)
+    flat = edge_verts
+    edge_verts = edge_verts.reshape(n_edges, 2)
+
+    # CSR adjacency: adj_edge[adj_off[v]:adj_off[v+1]] = edges touching vert v.
+    order = np.argsort(flat, kind='stable')
+    adj_edge = (order // 2).astype(np.int32)
+    counts = np.bincount(flat, minlength=n_verts)
+    adj_off = np.zeros(n_verts + 1, dtype=np.int64)
+    np.cumsum(counts, out=adj_off[1:])
+
+    return {
+        "vert_world": vert_world,
+        "edge_verts": edge_verts,
+        "adj_off": adj_off,
+        "adj_edge": adj_edge,
+        "matrix": None,  # per-view part below
+    }
+
+
+def _build_wire_view(cache, snapdata, radius):
+    """
+        Per-view part of the wire cache: project the verts to screen space and bin the visible ones
+        into a pixel grid (cell = wire radius). Redone when the view matrix or the radius changes.
+    """
+    matrix = np.array(snapdata.perspective_matrix, dtype=np.float32)
+    world = cache["vert_world"]
+    # Only rows x, y, w of the projection are needed for the screen-distance test.
+    proj = world @ matrix[[0, 1, 3], :3].T + matrix[[0, 1, 3], 3]
+    w = proj[:, 2]
     with np.errstate(divide='ignore', invalid='ignore'):
         sx = snapdata.width_half + (proj[:, 0] / w) * snapdata.width_half
         sy = snapdata.height_half + (proj[:, 1] / w) * snapdata.height_half
-    vert_screen = np.column_stack((sx, sy))
-    vert_screen[w <= 0] = np.inf  # Behind camera: never near the cursor.
+    screen = np.column_stack((sx, sy))
 
-    edge_verts = np.zeros(n_edges * 2, dtype=np.int64)
-    data.edges.foreach_get('vertices', edge_verts)
-    edge_verts.shape = (n_edges, 2)
+    # Grid only holds verts with a meaningful screen position; edges to the others are still drawn
+    # through the adjacency of their near endpoint. The magnitude clamp keeps the int cast safe.
+    cell = max(int(radius), 10)
+    usable = (w > 0) & np.isfinite(sx) & np.isfinite(sy) & (np.abs(sx) < 1e6) & (np.abs(sy) < 1e6)
+    grid_ids = np.nonzero(usable)[0]
+    if len(grid_ids) > 0:
+        cx = np.floor(screen[grid_ids, 0] / cell).astype(np.int64)
+        cy = np.floor(screen[grid_ids, 1] / cell).astype(np.int64)
+        min_x = int(cx.min())
+        min_y = int(cy.min())
+        cx -= min_x
+        cy -= min_y
+        ncols = int(cx.max()) + 1
+        cell_id = cy * ncols + cx
+        order = np.argsort(cell_id, kind='stable')
+        grid = {
+            "cell_id_sorted": cell_id[order],
+            "vert_ids": grid_ids[order].astype(np.int64),
+            "ncols": ncols, "min_x": min_x, "min_y": min_y,
+        }
+    else:
+        grid = {"cell_id_sorted": np.empty(0, dtype=np.int64), "vert_ids": np.empty(0, dtype=np.int64),
+                "ncols": 1, "min_x": 0, "min_y": 0}
 
-    cache = {
-        "matrix": snapdata.perspective_matrix.copy(),
-        "vert_screen": vert_screen,
-        "vert_world": vert_world,
-        "edge_verts": edge_verts,
-    }
+    cache["screen"] = screen
+    cache["grid"] = grid
+    cache["cell"] = cell
+    cache["matrix"] = snapdata.perspective_matrix.copy()
+
+
+def _wire_verts_near_mouse(cache, mouse_x, mouse_y, radius):
+    """Vert indices within radius px of the mouse, via the 3x3 grid cells around it."""
+    grid = cache["grid"]
+    vert_ids = grid["vert_ids"]
+    if len(vert_ids) == 0:
+        return None
+    cell = cache["cell"]
+    cell_sorted = grid["cell_id_sorted"]
+    ncols = grid["ncols"]
+    mcx = int(np.floor(mouse_x / cell)) - grid["min_x"]
+    mcy = int(np.floor(mouse_y / cell)) - grid["min_y"]
+    chunks = []
+    for dy in (-1, 0, 1):
+        cyy = mcy + dy
+        if cyy < 0:
+            continue
+        for dx in (-1, 0, 1):
+            cxx = mcx + dx
+            if cxx < 0 or cxx >= ncols:
+                continue
+            cid = cyy * ncols + cxx
+            lo = np.searchsorted(cell_sorted, cid, side='left')
+            hi = np.searchsorted(cell_sorted, cid, side='right')
+            if hi > lo:
+                chunks.append(vert_ids[lo:hi])
+    if not chunks:
+        return None
+    candidates = np.concatenate(chunks)
+    screen = cache["screen"]
+    dx = screen[candidates, 0] - mouse_x
+    dy = screen[candidates, 1] - mouse_y
+    near = candidates[(dx * dx + dy * dy) < (radius * radius)]
+    return near if len(near) > 0 else None
+
+
+def ensure_wire_static(self, context, object_name):
+    """
+        Get or build the static wire data for an object. Called from the modal side when an object
+        is first flagged heavy, so the one-time build does not happen inside the draw handler.
+    """
+    cache = self.local_wire_data.get(object_name)
+    if cache is not None:
+        return cache
+    cache = _build_wire_static(self, context, object_name)
+    if cache is None:
+        return None
+    # Static data for a very dense mesh is large; keep only a few objects around.
+    if len(self.local_wire_data) >= 4:
+        self.local_wire_data.pop(next(iter(self.local_wire_data)))
     self.local_wire_data[object_name] = cache
+    return cache
+
+
+def build_local_wire_cache(self, context, snapdata, object_name):
+    """
+        Return the wire cache for the object, building the static part once and the view part
+        whenever the view matrix or the radius setting changed. Returns None if no wire.
+    """
+    cache = ensure_wire_static(self, context, object_name)
+    if cache is None:
+        return None
+    radius = self.settings.local_wireframe_radius
+    if cache.get("matrix") != snapdata.perspective_matrix or cache.get("cell") != max(int(radius), 10):
+        _build_wire_view(cache, snapdata, radius)
     return cache
 
 
@@ -237,25 +353,21 @@ def draw_local_wireframe(self, context, snapdata, object_name):
     cache = build_local_wire_cache(self, context, snapdata, object_name)
     if cache is None:
         return
-    color = (*self.settings.local_wireframe_color, self.settings.local_wireframe_opacity)
 
     radius = self.settings.local_wireframe_radius
-    mouse_x, mouse_y = self.mouse_position[0], self.mouse_position[1]
-    vert_screen = cache["vert_screen"]
-    dx = vert_screen[:, 0] - mouse_x
-    dy = vert_screen[:, 1] - mouse_y
-    near = (dx * dx + dy * dy) < (radius * radius)
-
-    edge_verts = cache["edge_verts"]
-    a = edge_verts[:, 0]
-    b = edge_verts[:, 1]
-    edge_mask = near[a] | near[b]
-    selected = edge_verts[edge_mask]
-    if len(selected) == 0:
+    near_verts = _wire_verts_near_mouse(cache, self.mouse_position[0], self.mouse_position[1], radius)
+    if near_verts is None:
         return
 
+    # Edges incident to the near verts, via the adjacency. Dedup so alpha does not double up.
+    adj_off = cache["adj_off"]
+    edge_ids = _gather_ranges(adj_off[near_verts], adj_off[near_verts + 1], cache["adj_edge"])
+    if edge_ids is None:
+        return
+    selected = cache["edge_verts"][np.unique(edge_ids)]
+
     vert_world = cache["vert_world"]
-    coords = np.empty((len(selected) * 2, 3), dtype=np.float64)
+    coords = np.empty((len(selected) * 2, 3), dtype=np.float32)
     coords[0::2] = vert_world[selected[:, 0]]
     coords[1::2] = vert_world[selected[:, 1]]
 
@@ -264,16 +376,29 @@ def draw_local_wireframe(self, context, snapdata, object_name):
     depth_test = not self.settings.local_wireframe_xray
     if depth_test:
         region3d = context.space_data.region_3d
-        camera_position = np.array(region3d.view_matrix.inverted().translation, dtype=np.float64)
+        camera_position = np.array(region3d.view_matrix.inverted().translation, dtype=np.float32)
         cam_to = camera_position[None, :] - coords
         if not region3d.is_perspective:
-            camera_vector = np.array(region3d.view_rotation @ Vector((0.0, 0.0, -1.0)), dtype=np.float64)
+            camera_vector = np.array(region3d.view_rotation @ Vector((0.0, 0.0, -1.0)), dtype=np.float32)
             dist = np.sqrt(np.einsum('ij,ij->i', cam_to, cam_to))
             coords = coords - camera_vector[None, :] * dist[:, None] * 0.01
         else:
             coords = coords + cam_to * 0.01
 
-    draw_lines_3d(coords.astype(np.float32).tolist(), color=color, line_width=1, depth_test=depth_test)
+    color = (*self.settings.local_wireframe_color, self.settings.local_wireframe_opacity)
+    draw_lines_3d(coords.tolist(), color=color, line_width=1, depth_test=depth_test)
+
+
+def index_allowed(allowed_indices, value):
+    """
+        Membership test on a per-object allowed-index array. None allows everything. The arrays
+        come from ObjectPointData (arange + filters) so they are ascending: binary search instead
+        of a linear scan, which matters on multi-million point objects.
+    """
+    if allowed_indices is None:
+        return True
+    pos = np.searchsorted(allowed_indices, value)
+    return pos < len(allowed_indices) and allowed_indices[pos] == value
 
 
 def _blf_size(font_id, size):
@@ -825,7 +950,7 @@ def draw_face_center(self, context,
         # and face_index in allowed_indices
         # print(f"face index:{face_index}")
         # print(f"len(data.polygons):{len(data.polygons)}")
-        if face_index < len(data.polygons) and (allowed_indices is None or face_index in allowed_indices):
+        if face_index < len(data.polygons) and index_allowed(allowed_indices, face_index):
             target_polygon = data.polygons[face_index]
             center = obj.matrix_world @ target_polygon.center
             region3d = context.space_data.region_3d
@@ -844,7 +969,7 @@ def draw_face_center(self, context,
             midpoints = []
             for loop_index in range(0, target_polygon.loop_total):
                 current_loop = data.loops[target_polygon.loop_start + loop_index]
-                if allowed_indices is not None and current_loop.edge_index not in allowed_indices:
+                if not index_allowed(allowed_indices, current_loop.edge_index):
                     continue
                 loop_second = data.loops[target_polygon.loop_start + ((loop_index + 1) % target_polygon.loop_total)]
                 midpoint = obj.matrix_world @ ((data.vertices[current_loop.vertex_index].co +
@@ -863,7 +988,7 @@ def draw_face_center(self, context,
             camera_position = context.space_data.region_3d.view_matrix.inverted().translation
             points = []
             for vert_id in target_polygon.vertices:
-                if allowed_indices is not None and vert_id not in allowed_indices:
+                if not index_allowed(allowed_indices, vert_id):
                     continue
                 point = obj.matrix_world @ data.vertices[vert_id].co
                 point = add_camera_offset(point,

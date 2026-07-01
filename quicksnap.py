@@ -95,6 +95,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.target_npdata = {}
         self.local_wire_objects = set()
         self.local_wire_data = {}
+        self._heavy_cache = {}
         self.perf_wire_ms = 0.0
         self.no_selection_target = None
         self.ignore_modifiers = self.settings.ignore_modifiers
@@ -191,11 +192,18 @@ class QuickVertexSnapOperator(bpy.types.Operator):
     def _apply_wireframe_display(self, object_name):
         """
         Show the target/hover wireframe. Heavy meshes skip the native show_wire (too slow) and use
-        the cursor-local wireframe instead; light meshes keep show_wire.
+        the cursor-local wireframe instead; light meshes keep show_wire. The heavy check evaluates
+        modifiers, so memoize it per object instead of paying it on every mouse move.
         """
-        depsgraph = bpy.context.evaluated_depsgraph_get()
-        if quicksnap_utils.is_heavy_object(bpy.data.objects[object_name], self.settings, depsgraph):
+        heavy = self._heavy_cache.get(object_name)
+        if heavy is None:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            heavy = quicksnap_utils.is_heavy_object(bpy.data.objects[object_name], self.settings, depsgraph)
+            self._heavy_cache[object_name] = heavy
+        if heavy:
             self.local_wire_objects.add(object_name)
+            # Build the wire data now (modal side) rather than inside the draw handler.
+            quicksnap_render.ensure_wire_static(self, bpy.context, object_name)
         else:
             bpy.data.objects[object_name].show_wire = True
 
@@ -409,6 +417,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.hover_object = ""
         self.local_wire_objects = set()
         self.local_wire_data = {}
+        self._heavy_cache = {}
         self.perf_wire_ms = 0.0
         self.target_bounds = None
         self.source_highlight_data = None
@@ -756,6 +765,9 @@ class QuickVertexSnapOperator(bpy.types.Operator):
             for bm in self.target_npdata:
                 self.target_npdata[bm] = None
             self.target_npdata = {}
+        # Release the wire cache arrays (can be hundreds of MB for very dense meshes).
+        self.local_wire_data = {}
+        self._heavy_cache = {}
 
     def update_mouse_position(self, context, event):
         self.mouse_position = (event.mouse_region_x, event.mouse_region_y)
@@ -808,6 +820,10 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def handle_pie_menu_closed(self, context, event, region):
+        if self.ignore_modifiers != self.settings.ignore_modifiers:
+            # Evaluated/raw mesh choice changed: wire caches and heavy gating are stale.
+            self.local_wire_data = {}
+            self._heavy_cache = {}
         if self.settings.snap_source_type != self.snapdata_source.snap_type or \
                 self.ignore_modifiers != self.settings.ignore_modifiers:
             self.init_snap_data(context, region, True, False)
@@ -823,8 +839,8 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         pass
 
     def init_snap_data(self, context, region, revert_source, revert_target):
-        # Drop the local-wire cache so it rebuilds against the new projection.
-        self.local_wire_data = {}
+        # The local-wire cache stays: its static part (world coords/edges) is view-independent and
+        # its screen part re-projects itself when the view matrix no longer matches.
         if revert_source:
             self.snapdata_source.__init__(context, region, self.settings, self.selection_objects,
                                           quicksnap_utils.get_scene_objects(False), is_origin=True,
