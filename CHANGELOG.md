@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.2
+
+### Fixed
+- Precision fit no longer moves a snap that is already aligned. Matches now
+  require genuinely opposing surfaces, gap errors are trimmed hard so designed
+  clearances and shoulder gaps cannot pull the part (penetrations are kept and
+  weighted higher, since those are never by design), and the correction is only
+  applied when re-measuring shows the parts actually seat better than before.
+
 ## 1.5.1
 
 ### Added
