@@ -230,12 +230,11 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
     # Approximate world->local scale, to express search distances in the target's local space.
     inv_scale = float(np.mean(np.linalg.norm(inv_t[:3, :3], axis=0)))
     search_local = 2.0 * sample_radius * inv_scale
-
-    max_correction = 0.75 * sample_radius
-    total = np.zeros(3)
     closest = target_eval.closest_point_on_mesh
-    for _ in range(iterations):
-        local = (points + total) @ inv_t[:3, :3].T + inv_t[:3, 3]
+
+    def fit_pairs(offset):
+        """Nearest-surface pairs at points+offset, filtered to plausible mating surfaces."""
+        local = (points + offset) @ inv_t[:3, :3].T + inv_t[:3, 3]
         q = np.empty_like(points)
         qn = np.empty_like(points)
         found_mask = np.zeros(len(points), dtype=bool)
@@ -246,37 +245,49 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
                 qn[i] = normal[:]
                 found_mask[i] = True
         if found_mask.sum() < 8:
-            break
+            return None
         qw = q[found_mask] @ matrix_t[:3, :3].T + matrix_t[:3, 3]
         qnw = qn[found_mask] @ matrix_t[:3, :3].T
         lengths = np.linalg.norm(qnw, axis=1)
         lengths[lengths == 0] = 1
         qnw /= lengths[:, None]
-        pw = points[found_mask] + total
-        pnw = point_normals[found_mask]
+        pw = points[found_mask] + offset
 
-        # Stay on the mating features: matches must be near the contact and roughly facing us.
+        # Mating surfaces only: near the contact and genuinely facing each other.
         keep = ((qw - contact) ** 2).sum(axis=1) < (1.5 * sample_radius) ** 2
-        keep &= (pnw * qnw).sum(axis=1) < 0.2
+        keep &= (point_normals[found_mask] * qnw).sum(axis=1) < -0.5
         if keep.sum() < 8:
-            break
-        pw, qw, qnw = pw[keep], qw[keep], qnw[keep]
+            return None
+        err = ((pw[keep] - qw[keep]) * qnw[keep]).sum(axis=1)
 
-        # Point-to-plane errors, with outlier trimming. The trim keeps an absolute floor: when most
-        # surfaces already touch (median error near zero) the few matches carrying the real offset,
-        # e.g. the floor contact of a straight peg, must not be discarded as outliers.
-        err = ((pw - qw) * qnw).sum(axis=1)
+        # Gaps can be by design (clearances, shoulders); penetration never is. Trim gap errors
+        # hard so designed offsets cannot pull an aligned part, keep penetrations generously.
         med = np.median(np.abs(err))
-        trim = np.abs(err) <= max(3.0 * med, 0.15 * sample_radius)
+        gap_floor = max(3.0 * med, 0.02 * sample_radius)
+        pen_floor = max(3.0 * med, 0.15 * sample_radius)
+        trim = np.abs(err) <= np.where(err >= 0, gap_floor, pen_floor)
         if trim.sum() < 8:
-            break
-        e = err[trim]
-        n = qnw[trim]
+            return None
+        err = err[trim]
+        # Resolving penetration outranks closing a (possibly designed) gap.
+        weights = np.where(err < 0, 3.0, 1.0)
+        return err, qnw[keep][trim], weights
 
+    max_correction = 0.75 * sample_radius
+    total = np.zeros(3)
+    rms_start = None
+    for _ in range(iterations):
+        pairs = fit_pairs(total)
+        if pairs is None:
+            break
+        err, normals, weights = pairs
+        if rms_start is None:
+            rms_start = float(np.sqrt((err ** 2).mean()))
         # Damped least squares: unconstrained axes stay put instead of drifting.
-        a = n.T @ n
+        wn = normals * weights[:, None]
+        a = wn.T @ normals
         a += np.eye(3) * max(1e-4 * np.trace(a) / 3.0, 1e-12)
-        step = np.linalg.solve(a, -(n * e[:, None]).sum(axis=0))
+        step = np.linalg.solve(a, -(wn * err[:, None]).sum(axis=0))
         total += step
         dist = float(np.linalg.norm(total))
         if dist > max_correction:
@@ -284,7 +295,15 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
             break
         if float(np.linalg.norm(step)) < 1e-4 * sample_radius:
             break
-    if float(np.linalg.norm(total)) < 1e-9:
+
+    # Only move when it clearly seats better: an already aligned snap must stay put.
+    if rms_start is None or float(np.linalg.norm(total)) < 0.002 * sample_radius:
+        return None
+    pairs = fit_pairs(total)
+    if pairs is None:
+        return None
+    rms_end = float(np.sqrt((pairs[0] ** 2).mean()))
+    if rms_end >= 0.8 * rms_start:
         return None
     return Vector(total)
 
