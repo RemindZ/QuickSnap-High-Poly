@@ -10,6 +10,8 @@ from . import quicksnap_utils
 __name_addon__ = '.'.join(__name__.split('.')[:-1])
 logger = logging.getLogger(__name_addon__)
 
+SEARCH_RADIUS_PX = 20  # Pixel radius of the closest-point query; also the grid cell size.
+
 
 def time_it(func):
     def wrapper(*arg, **kw):
@@ -277,13 +279,19 @@ class SnapData:
         self.last_query_ms = 0.0
         # Screen-space grid for the heavy-mesh query (built lazily once ingestion is idle), so the
         # per-frame lookup only touches points near the cursor instead of scanning every point.
-        self._grid_cell = 20
+        # Cell size must stay >= the query radius for the 3x3 cell lookup to cover it.
+        self._grid_cell = SEARCH_RADIUS_PX
         self._grid_count = -1
         self._grid_cell_id_sorted = None
         self._grid_point_idx = None
         self._grid_ncols = 0
         self._grid_min_x = 0
         self._grid_min_y = 0
+        # Incremental candidates while ingesting: on timer ticks with an unchanged mouse, only the
+        # newly ingested tail is scanned instead of every point so far.
+        self._ingest_mouse = None
+        self._ingest_scan_n = 0
+        self._ingest_candidates = None
 
         # figure out origin count
         if not self.is_origin_snapdata or self.no_selection:  # Add all scene origins
@@ -636,14 +644,19 @@ class SnapData:
 
     def _build_screen_grid(self, n):
         """Bin the queryable points into a screen-space grid (cell = search radius) for fast lookups."""
-        idxs = np.nonzero(self.in_query[:n])[0]
-        if len(idxs) == 0:
-            self._grid_cell_id_sorted = np.empty(0, dtype=np.int64)
-            self._grid_point_idx = np.empty(0, dtype=np.int64)
-            self._grid_ncols = 1
-            self._grid_count = n
-            return
-        pts = self.region_2d[idxs, :2]
+        # Heavy scenes have in_query all True (only origins can differ); skip the gather then.
+        if self.in_query[:n].all():
+            idxs = None
+            pts = self.region_2d[:n, :2]
+        else:
+            idxs = np.nonzero(self.in_query[:n])[0]
+            if len(idxs) == 0:
+                self._grid_cell_id_sorted = np.empty(0, dtype=np.int64)
+                self._grid_point_idx = np.empty(0, dtype=np.int32)
+                self._grid_ncols = 1
+                self._grid_count = n
+                return
+            pts = self.region_2d[idxs, :2]
         cell = self._grid_cell
         cx = np.floor(pts[:, 0] / cell).astype(np.int64)
         cy = np.floor(pts[:, 1] / cell).astype(np.int64)
@@ -653,9 +666,14 @@ class SnapData:
         cy -= self._grid_min_y
         self._grid_ncols = int(cx.max()) + 1
         cell_id = cy * self._grid_ncols + cx
-        order = np.argsort(cell_id, kind='stable')
+        # Default sort: within-cell order is irrelevant (exact distances are recomputed per query)
+        # and the stable sort is 2x slower on large int arrays.
+        order = np.argsort(cell_id)
         self._grid_cell_id_sorted = cell_id[order]
-        self._grid_point_idx = idxs[order]
+        if idxs is None:
+            self._grid_point_idx = order.astype(np.int32)
+        else:
+            self._grid_point_idx = idxs[order].astype(np.int32)
         self._grid_count = n
 
     def _grid_candidates(self, mouse_x, mouse_y):
@@ -708,7 +726,7 @@ class SnapData:
 
         else:
             # Search all points
-            search_distance = 20  # Radius in pixels around the mouse position
+            search_distance = SEARCH_RADIUS_PX  # Radius in pixels around the mouse position
             weight_depth = 3
             weight_dist = 1
             if self.use_numpy_query:
@@ -723,26 +741,40 @@ class SnapData:
                         if self._grid_count != n:
                             self._build_screen_grid(n)
                         candidates = self._grid_candidates(mouse_x, mouse_y)
-                        if candidates is None:
-                            found_idx = np.empty(0, dtype=np.int64)
-                            found_d2 = np.empty(0, dtype=np.float64)
-                        else:
-                            cand_co = self.region_2d[candidates]
-                            cdx = cand_co[:, 0] - mouse_x
-                            cdy = cand_co[:, 1] - mouse_y
-                            cand_d2 = cdx * cdx + cdy * cdy
-                            within = cand_d2 < r2
-                            found_idx = candidates[within]
-                            found_d2 = cand_d2[within]
                     else:
-                        # Still ingesting: scan the points added so far.
-                        coords = self.region_2d[:n]
-                        dx = coords[:, 0] - mouse_x
-                        dy = coords[:, 1] - mouse_y
-                        d2 = dx * dx + dy * dy
-                        mask = (d2 < r2) & self.in_query[:n]
-                        found_idx = np.nonzero(mask)[0]
-                        found_d2 = d2[found_idx]
+                        # Still ingesting: the query runs on every timer tick, so keep the in-radius
+                        # candidates incrementally. Full scan only when the mouse actually moved;
+                        # otherwise scan just the points ingested since the previous call.
+                        mouse_key = (mouse_x, mouse_y)
+                        if self._ingest_mouse != mouse_key or self._ingest_candidates is None:
+                            coords = self.region_2d[:n]
+                            dx = coords[:, 0] - mouse_x
+                            dy = coords[:, 1] - mouse_y
+                            mask = (dx * dx + dy * dy < r2) & self.in_query[:n]
+                            self._ingest_candidates = np.nonzero(mask)[0]
+                            self._ingest_mouse = mouse_key
+                            self._ingest_scan_n = n
+                        elif self._ingest_scan_n < n:
+                            tail = self.region_2d[self._ingest_scan_n:n]
+                            dx = tail[:, 0] - mouse_x
+                            dy = tail[:, 1] - mouse_y
+                            mask = (dx * dx + dy * dy < r2) & self.in_query[self._ingest_scan_n:n]
+                            new_idx = np.nonzero(mask)[0] + self._ingest_scan_n
+                            if len(new_idx) > 0:
+                                self._ingest_candidates = np.concatenate((self._ingest_candidates, new_idx))
+                            self._ingest_scan_n = n
+                        candidates = self._ingest_candidates if len(self._ingest_candidates) > 0 else None
+                    if candidates is None:
+                        found_idx = np.empty(0, dtype=np.int64)
+                        found_d2 = np.empty(0, dtype=np.float64)
+                    else:
+                        cand_co = self.region_2d[candidates]
+                        cdx = cand_co[:, 0] - mouse_x
+                        cdy = cand_co[:, 1] - mouse_y
+                        cand_d2 = cdx * cdx + cdy * cdy
+                        within = cand_d2 < r2
+                        found_idx = candidates[within]
+                        found_d2 = cand_d2[within]
                     if len(found_idx) > 0:
                         dists = np.sqrt(found_d2)
                         dist = dists / search_distance
