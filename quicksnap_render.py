@@ -206,20 +206,22 @@ def _build_wire_static(self, context, object_name):
     if n_verts == 0 or n_edges == 0:
         return None
 
-    co = np.empty(n_verts * 3, dtype=np.float64)
+    # float32 matches Blender's internal vertex storage, so foreach_get takes the bulk-copy path.
+    co = np.empty(n_verts * 3, dtype=np.float32)
     data.vertices.foreach_get('co', co)
     co.shape = (n_verts, 3)
-    matrix = np.array(obj.matrix_world, dtype=np.float64)
-    vert_world = (co @ matrix[:3, :3].T + matrix[:3, 3]).astype(np.float32)
+    matrix = np.array(obj.matrix_world, dtype=np.float32)
+    vert_world = co @ matrix[:3, :3].T + matrix[:3, 3]
 
     edge_verts = np.zeros(n_edges * 2, dtype=np.int32)
     data.edges.foreach_get('vertices', edge_verts)
     flat = edge_verts
     edge_verts = edge_verts.reshape(n_edges, 2)
 
-    # CSR adjacency: adj_edge[adj_off[v]:adj_off[v+1]] = edges touching vert v.
-    order = np.argsort(flat, kind='stable')
-    adj_edge = (order // 2).astype(np.int32)
+    # CSR adjacency: adj_edge[adj_off[v]:adj_off[v+1]] = edges touching vert v. Default sort:
+    # within-vertex edge order is irrelevant (edge ids get deduped) and stable is 2x slower.
+    order = np.argsort(flat)
+    adj_edge = (order >> 1).astype(np.int32)
     counts = np.bincount(flat, minlength=n_verts)
     adj_off = np.zeros(n_verts + 1, dtype=np.int64)
     np.cumsum(counts, out=adj_off[1:])
@@ -262,20 +264,22 @@ def _build_wire_view(cache, snapdata, radius):
         cy -= min_y
         ncols = int(cx.max()) + 1
         cell_id = cy * ncols + cx
-        order = np.argsort(cell_id, kind='stable')
+        order = np.argsort(cell_id)  # within-cell order is irrelevant; stable is 2x slower
         grid = {
             "cell_id_sorted": cell_id[order],
-            "vert_ids": grid_ids[order].astype(np.int64),
+            "vert_ids": grid_ids[order].astype(np.int32),
             "ncols": ncols, "min_x": min_x, "min_y": min_y,
         }
     else:
-        grid = {"cell_id_sorted": np.empty(0, dtype=np.int64), "vert_ids": np.empty(0, dtype=np.int64),
+        grid = {"cell_id_sorted": np.empty(0, dtype=np.int64), "vert_ids": np.empty(0, dtype=np.int32),
                 "ncols": 1, "min_x": 0, "min_y": 0}
 
     cache["screen"] = screen
     cache["grid"] = grid
     cache["cell"] = cell
     cache["matrix"] = snapdata.perspective_matrix.copy()
+    cache.pop("frame_key", None)  # cached frame batch is view-dependent
+    cache.pop("batch", None)
 
 
 def _wire_verts_near_mouse(cache, mouse_x, mouse_y, radius):
@@ -320,13 +324,19 @@ def ensure_wire_static(self, context, object_name):
     """
     cache = self.local_wire_data.get(object_name)
     if cache is not None:
+        # Refresh recency so the eviction below is a real LRU.
+        self.local_wire_data[object_name] = self.local_wire_data.pop(object_name)
         return cache
     cache = _build_wire_static(self, context, object_name)
     if cache is None:
         return None
-    # Static data for a very dense mesh is large; keep only a few objects around.
-    if len(self.local_wire_data) >= 4:
-        self.local_wire_data.pop(next(iter(self.local_wire_data)))
+    # Static data for a very dense mesh is large; keep only the working set (target + hover)
+    # and never evict an object that is currently being drawn.
+    while len(self.local_wire_data) >= 2:
+        victim = next((key for key in self.local_wire_data if key not in self.local_wire_objects), None)
+        if victim is None:
+            break
+        self.local_wire_data.pop(victim)
     self.local_wire_data[object_name] = cache
     return cache
 
@@ -345,16 +355,58 @@ def build_local_wire_cache(self, context, snapdata, object_name):
     return cache
 
 
+_numpy_batch_ok = True  # Whether batch_for_shader accepts numpy arrays; falls back to lists once.
+
+
+def _lines_batch(coords):
+    """Build a LINES batch from an (N,3) float32 array, falling back to lists on old builds."""
+    global _numpy_batch_ok
+    if _numpy_batch_ok:
+        try:
+            return batch_for_shader(shader_3d_uniform_color, 'LINES', {"pos": coords})
+        except (TypeError, ValueError):
+            _numpy_batch_ok = False
+    return batch_for_shader(shader_3d_uniform_color, 'LINES', {"pos": coords.tolist()})
+
+
+def _draw_lines_batch(batch, color, depth_test):
+    gpu.state.blend_set("ALPHA")
+    if depth_test:
+        gpu.state.depth_test_set("LESS")
+    shader_3d_uniform_color.bind()
+    shader_3d_uniform_color.uniform_float("color", color)
+    batch.draw(shader_3d_uniform_color)
+    gpu.state.blend_set("NONE")
+    if depth_test:
+        gpu.state.depth_test_set("NONE")
+
+
 def draw_local_wireframe(self, context, snapdata, object_name):
     """
         Draw the mesh edges near the cursor for heavy objects (cheaper than the native show_wire).
         An edge is drawn if either endpoint is within the radius, so long edges are drawn in full.
+        The built batch is cached: redraws with an unchanged mouse/view reuse it as-is.
     """
     cache = build_local_wire_cache(self, context, snapdata, object_name)
     if cache is None:
         return
+    region3d = context.space_data.region_3d
+    if cache["matrix"] != region3d.perspective_matrix:
+        # Navigating (orbit/zoom): the snap data projection is stale, so hide the wire rather than
+        # draw a patch frozen to the pre-navigation view. Reappears on the next mouse move.
+        return
 
+    depth_test = not self.settings.local_wireframe_xray
+    color = (*self.settings.local_wireframe_color, self.settings.local_wireframe_opacity)
     radius = self.settings.local_wireframe_radius
+    key = (self.mouse_position[0], self.mouse_position[1], radius, depth_test)
+    if cache.get("frame_key") == key:
+        if cache.get("batch") is not None:
+            _draw_lines_batch(cache["batch"], color, depth_test)
+        return
+
+    cache["frame_key"] = key
+    cache["batch"] = None
     near_verts = _wire_verts_near_mouse(cache, self.mouse_position[0], self.mouse_position[1], radius)
     if near_verts is None:
         return
@@ -373,9 +425,7 @@ def draw_local_wireframe(self, context, snapdata, object_name):
 
     # Depth test (default) hides the far side so only the surface you see is wireframed; x-ray draws
     # through. When depth testing, nudge the verts towards the camera to avoid z-fighting the surface.
-    depth_test = not self.settings.local_wireframe_xray
     if depth_test:
-        region3d = context.space_data.region_3d
         camera_position = np.array(region3d.view_matrix.inverted().translation, dtype=np.float32)
         cam_to = camera_position[None, :] - coords
         if not region3d.is_perspective:
@@ -385,8 +435,8 @@ def draw_local_wireframe(self, context, snapdata, object_name):
         else:
             coords = coords + cam_to * 0.01
 
-    color = (*self.settings.local_wireframe_color, self.settings.local_wireframe_opacity)
-    draw_lines_3d(coords.tolist(), color=color, line_width=1, depth_test=depth_test)
+    cache["batch"] = _lines_batch(coords)
+    _draw_lines_batch(cache["batch"], color, depth_test)
 
 
 def index_allowed(allowed_indices, value):
