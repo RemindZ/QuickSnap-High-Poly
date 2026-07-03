@@ -193,24 +193,31 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
         count = len(data.vertices)
         if count == 0:
             continue
-        co = np.empty(count * 3, dtype=np.float64)
+        # Rank in float32 object space (matches Blender's storage, so foreach_get bulk-copies, and
+        # skips a full-mesh world transform); only the selected samples go to float64 world space.
+        co = np.empty(count * 3, dtype=np.float32)
         data.vertices.foreach_get('co', co)
         co.shape = (count, 3)
         matrix = np.array(data_obj.matrix_world, dtype=np.float64)
-        world = co @ matrix[:3, :3].T + matrix[:3, 3]
-        d2 = ((world - contact) ** 2).sum(axis=1)
+        inv_m = np.array(data_obj.matrix_world.inverted(), dtype=np.float64)
+        contact_local = (inv_m[:3, :3] @ contact + inv_m[:3, 3]).astype(np.float32)
+        diff = co - contact_local
+        d2_local = np.einsum('ij,ij->i', diff, diff)
         keep = min(sample_count, count)
-        sel = np.argpartition(d2, keep - 1)[:keep]
+        sel = np.argpartition(d2_local, keep - 1)[:keep]
+        world = co[sel].astype(np.float64) @ matrix[:3, :3].T + matrix[:3, 3]
+        d2 = ((world - contact) ** 2).sum(axis=1)
         normals = np.empty((keep, 3), dtype=np.float64)
         verts = data.vertices
         for i, vid in enumerate(sel):
             normals[i] = verts[int(vid)].normal[:]
-        normals = normals @ matrix[:3, :3].T
+        # Normals transform by the inverse-transpose, so non-uniform scale stays correct.
+        normals = normals @ inv_m[:3, :3]
         lengths = np.linalg.norm(normals, axis=1)
         lengths[lengths == 0] = 1
-        sample_co.append(world[sel])
+        sample_co.append(world)
         sample_no.append(normals / lengths[:, None])
-        sample_d2.append(d2[sel])
+        sample_d2.append(d2)
     if not sample_co:
         return None
     points = np.concatenate(sample_co)
@@ -247,7 +254,8 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
         if found_mask.sum() < 8:
             return None
         qw = q[found_mask] @ matrix_t[:3, :3].T + matrix_t[:3, 3]
-        qnw = qn[found_mask] @ matrix_t[:3, :3].T
+        # Normals transform by the inverse-transpose, so non-uniform scale stays correct.
+        qnw = qn[found_mask] @ inv_t[:3, :3]
         lengths = np.linalg.norm(qnw, axis=1)
         lengths[lengths == 0] = 1
         qnw /= lengths[:, None]
@@ -283,6 +291,14 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
         err, normals, weights = pairs
         if rms_start is None:
             rms_start = float(np.sqrt((err ** 2).mean()))
+            # A coherent one-sided standoff (no penetration, uniform gap, single surface
+            # orientation) is indistinguishable from a designed offset: leave the snap exact.
+            # Multi-orientation gaps (e.g. slanted walls) still seat normally.
+            if err.min() >= 0:
+                mean_gap = float(err.mean())
+                one_plane = float(np.linalg.norm(normals.mean(axis=0))) > 0.95
+                if one_plane and float(err.std()) < 0.15 * max(mean_gap, 1e-12):
+                    return None
         # Damped least squares: unconstrained axes stay put instead of drifting.
         wn = normals * weights[:, None]
         a = wn.T @ normals
