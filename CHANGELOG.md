@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.5.3
+
+Performance and accuracy pass over the 1.5.x additions, driven by a full audit.
+
+### Performance
+- While a heavy object's points are still loading, the closest-point query now
+  scans only the newly loaded points on each tick instead of everything so far
+  (a per-tick cost that grew with mesh size is now near constant).
+- The wireframe's edge-adjacency and grid builds use the default sort instead of
+  a stable one (order within a bucket never mattered): roughly halves the
+  one-time build per heavy object and the per-orbit rebuild.
+- Vertex coordinates are read in float32 (matching Blender's storage, enabling
+  the bulk copy path) for the wireframe build and the precision-fit sampling.
+- The near-cursor wireframe batch is cached: redraws with an unchanged mouse and
+  view reuse the built GPU batch instead of recomputing everything each frame,
+  and the batch uploads from numpy directly where supported.
+- The wire cache keeps only the objects being displayed (was up to four) and
+  never evicts one that is on screen, avoiding repeated multi-second rebuilds
+  when sweeping across many heavy objects.
+
+### Fixed
+- Precision fit: a part hovering at a uniform standoff over a single flat
+  surface is no longer pulled down to touch (indistinguishable from a designed
+  offset, so the snap stays exact). Multi-wall seating is unchanged.
+- Precision fit: normals are now transformed by the inverse transpose, so
+  non-uniformly scaled objects filter and fit correctly.
+- The cursor wireframe hides during orbit/zoom instead of drawing a patch
+  frozen to the pre-navigation view (it reappears on the next mouse move).
+- The grid cell size and the snap search radius are tied to one constant so
+  they cannot drift apart.
+
 ## 1.5.2
 
 ### Fixed
