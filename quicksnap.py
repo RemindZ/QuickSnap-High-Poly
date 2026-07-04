@@ -97,6 +97,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.local_wire_data = {}
         self._heavy_cache = {}
         self.perf_wire_ms = 0.0
+        self.selection_hidden = False
         self.no_selection_target = None
         self.ignore_modifiers = self.settings.ignore_modifiers
         self.target_face_index = -1
@@ -191,10 +192,18 @@ class QuickVertexSnapOperator(bpy.types.Operator):
 
     def _apply_wireframe_display(self, object_name):
         """
-        Show the target/hover wireframe. Heavy meshes skip the native show_wire (too slow) and use
-        the cursor-local wireframe instead; light meshes keep show_wire. The heavy check evaluates
-        modifiers, so memoize it per object instead of paying it on every mouse move.
+        Show the target/hover wireframe. Style is user-selectable; in automatic mode heavy meshes
+        skip the native show_wire (too slow) and use the cursor-local wireframe instead. The heavy
+        check evaluates modifiers, so memoize it per object instead of paying it every mouse move.
         """
+        style = self.settings.wireframe_style
+        if style == 'LOCAL' and bpy.data.objects[object_name].type == 'MESH':
+            self.local_wire_objects.add(object_name)
+            quicksnap_render.ensure_wire_static(self, bpy.context, object_name)
+            return
+        if style == 'NATIVE':
+            bpy.data.objects[object_name].show_wire = True
+            return
         heavy = self._heavy_cache.get(object_name)
         if heavy is None:
             depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -206,6 +215,23 @@ class QuickVertexSnapOperator(bpy.types.Operator):
             quicksnap_render.ensure_wire_static(self, bpy.context, object_name)
         else:
             bpy.data.objects[object_name].show_wire = True
+
+    def set_selection_hidden(self, hidden):
+        """
+        Hide/show the objects being moved (stage 2 clarity feature). Hiding drops the selection,
+        so unhiding re-selects. While hidden the live translate is skipped by Blender, which is
+        fine: the position only matters when visible, and every unhide is followed by an apply.
+        """
+        if not self.object_mode or self.selection_hidden == hidden:
+            return
+        for object_name in self.selection_objects:
+            obj = bpy.data.objects.get(object_name)
+            if obj is None:
+                continue
+            obj.hide_set(hidden)
+            if not hidden:
+                obj.select_set(True)
+        self.selection_hidden = hidden
 
     def run_precision_fit(self, context):
         """
@@ -363,6 +389,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
                     bpy.data.objects[obj].hide_set(False)
                 for obj in self.selection_objects:  # re-select selection that might be lost in previous steps
                     bpy.data.objects[obj].select_set(True)
+                self.selection_hidden = False  # the raycast dance above just unhid everything
 
                 # Find the closest target points
                 closest = self.snapdata_target.find_closest(mouse_coord_screen_flat)
@@ -374,6 +401,11 @@ class QuickVertexSnapOperator(bpy.types.Operator):
                     self.closest_target_id = -1
                     self.distance = -1
                     self.set_object_display("", hover_object)
+
+            # Hide the moving objects while the mouse is over another object, so the target
+            # geometry is unobstructed; they reappear as soon as the mouse leaves it.
+            if self.settings.hide_selection_over_target:
+                self.set_selection_hidden(hover_object != "")
 
 
     def apply(self, context, region, use_auto_merge=False):
@@ -449,6 +481,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.local_wire_data = {}
         self._heavy_cache = {}
         self.perf_wire_ms = 0.0
+        self.selection_hidden = False
         self.target_bounds = None
         self.source_highlight_data = None
         self.source_allowed_indices = None
@@ -592,6 +625,8 @@ class QuickVertexSnapOperator(bpy.types.Operator):
                 self.set_object_display("", "")
                 self.update_header(context)
             elif event.value == 'PRESS' or self.clickdrag:  # Disable the tool on mouse release if click dragging.
+                # Unhide before the final apply: translate skips hidden objects.
+                self.set_selection_hidden(False)
                 # Last translation for applying auto-merge
                 self.apply(context, region, use_auto_merge=self.settings.use_auto_merge)
                 self.run_precision_fit(context)
@@ -754,6 +789,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         End modal operator, reset header, etc
         """
         # logger.info("terminate")
+        self.set_selection_hidden(False)
         if revert:
             self.revert_data(context, apply=True)
 
@@ -939,6 +975,25 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
         ],
         default="ALWAYS", )
     display_target_wireframe: bpy.props.BoolProperty(name="Display target object wireframe", default=True)
+    wireframe_style: bpy.props.EnumProperty(
+        name="Wireframe style",
+        description="How the target/hover object wireframe is drawn",
+        items=[
+            ("AUTO", "Automatic (by vertex threshold)",
+             "Native full wireframe for light meshes, cursor-local wireframe for heavy ones", 0),
+            ("LOCAL", "Cursor-local always",
+             "Always draw only the edges around the cursor, regardless of mesh size", 1),
+            ("NATIVE", "Native full wireframe always",
+             "Always use Blender's full object wireframe overlay", 2),
+        ],
+        default="AUTO")
+    hide_selection_over_target: bpy.props.BoolProperty(
+        name="Hide dragged objects over the target",
+        description="While picking the snap destination, hide the objects being moved whenever the"
+                    " mouse is over another object so the target geometry is unobstructed. They"
+                    " reappear when the mouse moves off the target and on confirm/cancel."
+                    " Object mode only",
+        default=True)
     highlight_target_vertex_edges: bpy.props.BoolProperty(name="Enable highlighting of target vertex edges*",
                                                           default=True)
     edge_highlight_width: bpy.props.IntProperty(name="Highlight Width", default=2, min=1, max=10)
@@ -1095,7 +1150,10 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
             fit_box.prop(self, "precision_fit_samples")
         col.prop(self, "snap_objects_origin")
         col.prop(self, "draw_rubberband")
+        col.prop(self, "hide_selection_over_target")
         col.prop(self, "display_target_wireframe")
+        if self.display_target_wireframe:
+            col.prop(self, "wireframe_style")
         col.prop(self, "display_potential_target_points")
         col.prop(self, "selection_square_size")
         col.separator()
