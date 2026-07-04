@@ -96,6 +96,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.local_wire_objects = set()
         self.local_wire_data = {}
         self._heavy_cache = {}
+        self._corner_cache = {}
         self.perf_wire_ms = 0.0
         self.selection_hidden = False
         self.no_selection_target = None
@@ -215,6 +216,49 @@ class QuickVertexSnapOperator(bpy.types.Operator):
             quicksnap_render.ensure_wire_static(self, bpy.context, object_name)
         else:
             bpy.data.objects[object_name].show_wire = True
+
+    def corner_score_candidates(self, snapdata, object_ids, mesh_indices, spline_ids):
+        """
+        Corner-likeness in [0,1] for each snap candidate, used to bias vertex picking towards
+        feature corners. A vertex's incident edge directions cancel out on flat areas and along
+        straight edges, but all point into the solid at a corner, so the length of their mean is
+        a cheap, topology-exact cornerness measure. Uses the wireframe adjacency cache; memoized
+        per (object, vertex) since the same candidates recur across mouse moves.
+        """
+        boost = np.zeros(len(object_ids), dtype=np.float64)
+        for i in range(len(object_ids)):
+            oid = int(object_ids[i])
+            vid = int(mesh_indices[i])
+            if vid < 0 or int(spline_ids[i]) >= 0 or oid < 0 or oid >= len(snapdata.scene_meshes):
+                continue
+            key = (snapdata.scene_meshes[oid], vid)
+            cached = self._corner_cache.get(key)
+            if cached is None:
+                cached = 0.0
+                cache = quicksnap_render.ensure_wire_static(self, bpy.context, key[0])
+                if cache is not None and vid < len(cache["adj_off"]) - 1:
+                    lo = int(cache["adj_off"][vid])
+                    hi = int(cache["adj_off"][vid + 1])
+                    if hi - lo >= 2:
+                        pair = cache["edge_verts"][cache["adj_edge"][lo:hi]]
+                        others = np.where(pair[:, 0] == vid, pair[:, 1], pair[:, 0])
+                        dirs = cache["vert_world"][others].astype(np.float64) - cache["vert_world"][vid]
+                        lengths = np.linalg.norm(dirs, axis=1)
+                        valid = lengths > 0
+                        if valid.sum() >= 2:
+                            dirs = dirs[valid] / lengths[valid][:, None]
+                            resultant = float(np.linalg.norm(dirs.mean(axis=0)))
+                            cached = min(resultant / 0.5, 1.0)  # saturate: a box corner is ~0.58
+                self._corner_cache[key] = cached
+            boost[i] = cached
+        return boost
+
+    def get_corner_score_fn(self, snapdata):
+        """The corner bias callback for find_closest, or None when the feature is off."""
+        if not self.settings.corner_snapping:
+            return None
+        return lambda object_ids, mesh_indices, spline_ids: \
+            self.corner_score_candidates(snapdata, object_ids, mesh_indices, spline_ids)
 
     def set_selection_hidden(self, hidden):
         """
@@ -339,7 +383,8 @@ class QuickVertexSnapOperator(bpy.types.Operator):
 
             # Find source vert/point the closest to the mouse, change cursor crosshair
             closest = self.snapdata_source.find_closest(mouse_coord_screen_flat,
-                                                        search_origins_only=self.snapdata_source.snap_type == 'ORIGINS')
+                                                        search_origins_only=self.snapdata_source.snap_type == 'ORIGINS',
+                                                        corner_score_fn=self.get_corner_score_fn(self.snapdata_source))
             if closest is not None:
                 (self.closest_source_id, self.distance, target_name, is_root, mesh_vertid) = closest
                 self.set_object_display(target_name, hover_object, is_root)
@@ -392,7 +437,8 @@ class QuickVertexSnapOperator(bpy.types.Operator):
                 self.selection_hidden = False  # the raycast dance above just unhid everything
 
                 # Find the closest target points
-                closest = self.snapdata_target.find_closest(mouse_coord_screen_flat)
+                closest = self.snapdata_target.find_closest(
+                    mouse_coord_screen_flat, corner_score_fn=self.get_corner_score_fn(self.snapdata_target))
                 if closest is not None:
                     (self.closest_target_id, self.distance, target_object_name, is_root, mesh_vertid) = closest
                     self.set_object_display(target_object_name, hover_object, is_root, mesh_vertid=mesh_vertid)
@@ -480,6 +526,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.local_wire_objects = set()
         self.local_wire_data = {}
         self._heavy_cache = {}
+        self._corner_cache = {}
         self.perf_wire_ms = 0.0
         self.selection_hidden = False
         self.target_bounds = None
@@ -835,6 +882,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         # Release the wire cache arrays (can be hundreds of MB for very dense meshes).
         self.local_wire_data = {}
         self._heavy_cache = {}
+        self._corner_cache = {}
 
     def update_mouse_position(self, context, event):
         self.mouse_position = (event.mouse_region_x, event.mouse_region_y)
@@ -891,6 +939,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
             # Evaluated/raw mesh choice changed: wire caches and heavy gating are stale.
             self.local_wire_data = {}
             self._heavy_cache = {}
+            self._corner_cache = {}
         if self.settings.snap_source_type != self.snapdata_source.snap_type or \
                 self.ignore_modifiers != self.settings.ignore_modifiers:
             self.init_snap_data(context, region, True, False)
@@ -993,6 +1042,12 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
                     " mouse is over another object so the target geometry is unobstructed. They"
                     " reappear when the mouse moves off the target and on confirm/cancel."
                     " Object mode only",
+        default=True)
+    corner_snapping: bpy.props.BoolProperty(
+        name="Prefer corners (vertex snapping)",
+        description="When snapping to vertices, favor corner vertices (where the mesh edges point"
+                    " into the surface, like the corners of a peg or socket) over vertices on flat"
+                    " areas near the cursor. Makes grabbing the corners of mating features easier",
         default=True)
     highlight_target_vertex_edges: bpy.props.BoolProperty(name="Enable highlighting of target vertex edges*",
                                                           default=True)
@@ -1151,6 +1206,7 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
         col.prop(self, "snap_objects_origin")
         col.prop(self, "draw_rubberband")
         col.prop(self, "hide_selection_over_target")
+        col.prop(self, "corner_snapping")
         col.prop(self, "display_target_wireframe")
         if self.display_target_wireframe:
             col.prop(self, "wireframe_style")

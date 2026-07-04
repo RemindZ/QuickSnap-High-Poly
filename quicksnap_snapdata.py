@@ -702,11 +702,13 @@ class SnapData:
             return None
         return np.concatenate(chunks)
 
-    def find_closest(self, mouse_coord_screen_flat, search_origins_only=False):
+    def find_closest(self, mouse_coord_screen_flat, search_origins_only=False, corner_score_fn=None):
         """
         Returns the closest point to mouse cursor amongst SnapData's points
         returns tuple:
          (Closest point ID, closest point distance to mouse, target object name, bool: is the point an object origin)
+        corner_score_fn: optional callable(object_ids, mesh_indices, spline_ids) -> boosts in [0,1];
+        candidates get a scoring bonus by how corner-like they are (vertex snapping only).
         """
         query_start = time.perf_counter()
         if not len(self.region_2d) > 0:
@@ -785,6 +787,10 @@ class SnapData:
 
                         score = (depth * weight_depth + dist * weight_dist + dist * depth) / (
                                 weight_depth + weight_dist)
+                        if corner_score_fn is not None and self.snap_type == 'POINTS':
+                            boost = corner_score_fn(self.object_id[found_idx], self.indices[found_idx],
+                                                    self.spline_index[found_idx])
+                            score = score * (1.0 - 0.4 * boost)
                         best_match_i = np.argmin(score)
                         match_index = int(found_idx[best_match_i])
                         best_dist = float(dists[best_match_i])
@@ -806,6 +812,11 @@ class SnapData:
                     depth = depth / np.amax(depth)  # Normalized depth
 
                     score = (depth * weight_depth + dist * weight_dist + dist * depth) / (weight_depth + weight_dist)
+                    if corner_score_fn is not None and self.snap_type == 'POINTS':
+                        idx_arr = np.array([p[1] for p in points_found], dtype=np.int64)
+                        boost = corner_score_fn(self.object_id[idx_arr], self.indices[idx_arr],
+                                                self.spline_index[idx_arr])
+                        score = score * (1.0 - 0.4 * boost)
 
                     best_match_i = np.argmin(score)  # index of best score within the points found.
                     match_index = points_found[best_match_i][1]  # index of best score within all points arrays
