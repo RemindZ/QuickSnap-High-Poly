@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.5
+
+### Added
+- **Prefer corners (vertex snapping)** (toggleable, on by default): when picking
+  vertices, corner vertices (peg/socket corners, crease ends, borders) get a
+  scoring bonus over vertices on flat or gently curved areas near the cursor,
+  making the corners of mating features much easier to grab. Cornerness comes
+  from the mesh topology (how strongly a vertex's edge directions point into
+  the surface), is computed only for the few candidates under the cursor and
+  cached, and applies to both the source and the destination pick. Vertex/curve
+  point mode only; curve points are unaffected.
+
 ## 1.5.4
 
 ### Added
