@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.4
+
+### Added
+- **Wireframe style** preference: choose how the target/hover wireframe is
+  drawn. "Automatic" keeps the vertex-threshold behavior, "Cursor-local always"
+  never shows a full object wireframe regardless of mesh size, "Native always"
+  restores the original overlay everywhere.
+- **Hide dragged objects over the target** (object mode, on by default): while
+  picking the snap destination, the objects being moved are hidden whenever the
+  mouse is over another object so the target geometry is unobstructed. They
+  reappear as soon as the mouse leaves the target, and on confirm/cancel.
+
 ## 1.5.3
 
 Performance and accuracy pass over the 1.5.x additions, driven by a full audit.
