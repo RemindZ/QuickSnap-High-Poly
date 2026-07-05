@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.6
+
+### Fixed
+- Fix a crash on tool start (NameError: numpy was not imported in the operator
+  module) introduced with corner-preferring vertex snapping in 1.5.5.
+
 ## 1.5.5
 
 ### Added

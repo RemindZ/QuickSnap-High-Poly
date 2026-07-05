@@ -2,6 +2,7 @@
 import bmesh
 import bpy
 import logging
+import numpy as np
 from mathutils import Vector
 
 from . import quicksnap_render
