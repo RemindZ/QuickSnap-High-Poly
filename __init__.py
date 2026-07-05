@@ -7,7 +7,7 @@ bl_info = {
     "name": "QuickSnap",
     "author": "Julien Heijmans",
     "blender": (2, 93, 0),
-    'version': (1, 5, 6),
+    'version': (1, 5, 7),
     "category": "3D View",
     "description": "Quickly snap objects/vertices/curve points",
     "warning": "",
@@ -43,6 +43,14 @@ def register():
 
 
 def unregister():
+    # Purge any draw handlers left registered (e.g. if a tool session was running), so they do not
+    # keep firing against a freed operator after the addon is disabled or reloaded.
+    render_module = sys.modules.get(f"{__name__}.quicksnap_render")
+    if render_module is not None and hasattr(render_module, 'remove_draw_handlers'):
+        try:
+            render_module.remove_draw_handlers()
+        except Exception:
+            pass
     for current_module_name in modulesFullNames.values():
         if current_module_name in sys.modules:
             if hasattr(sys.modules[current_module_name], 'unregister'):

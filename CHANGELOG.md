@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.7
+
+### Fixed
+- Stop "ReferenceError: StructRNA ... has been removed" spam from the viewport
+  draw callbacks. If the tool operator is ever freed without a clean shutdown
+  (a mid-session error, a script reload), its draw handlers no longer keep
+  firing against the dead operator: the handlers are tracked centrally, the
+  draw callbacks detect a freed operator and unregister themselves, and any
+  leftover handlers are purged when the addon is disabled or reloaded.
+- Corner-preferring vertex snapping can no longer raise during a snap; on any
+  unexpected error it is skipped for that query instead of ending the tool.
+
 ## 1.5.6
 
 ### Fixed

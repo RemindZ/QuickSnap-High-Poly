@@ -532,10 +532,46 @@ fade_duration = 0.2
 
 
 
+_draw_handle_2d = None
+_draw_handle_3d = None
+
+
+def add_draw_handlers(operator, context):
+    """Register the 2D/3D draw handlers and track the handles so they can always be removed,
+    even if the operator instance is later freed without a clean terminate()."""
+    remove_draw_handlers()
+    global _draw_handle_2d, _draw_handle_3d
+    args = (operator, context)
+    _draw_handle_2d = bpy.types.SpaceView3D.draw_handler_add(draw_callback_2d, args, 'WINDOW', 'POST_PIXEL')
+    _draw_handle_3d = bpy.types.SpaceView3D.draw_handler_add(draw_callback_3d, args, 'WINDOW', 'POST_VIEW')
+
+
+def remove_draw_handlers():
+    """Remove the tracked draw handlers if present. Safe to call repeatedly."""
+    global _draw_handle_2d, _draw_handle_3d
+    if _draw_handle_2d is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_draw_handle_2d, 'WINDOW')
+        except (ValueError, ReferenceError):
+            pass
+        _draw_handle_2d = None
+    if _draw_handle_3d is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_draw_handle_3d, 'WINDOW')
+        except (ValueError, ReferenceError):
+            pass
+        _draw_handle_3d = None
+
+
 def draw_callback_2d(self, context):
     """
         Draw all QuickSnap 2D UI: Icons, source/target square. rubberband/
     """
+    try:
+        self.current_state  # a freed operator raises ReferenceError on any attribute access
+    except ReferenceError:
+        remove_draw_handlers()  # orphaned handler: unregister so it stops firing
+        return
     if self.settings.log_level == 2:
         draw_perf_hud(self, context)
     square_width=self.settings.selection_square_size
@@ -688,6 +724,11 @@ def draw_callback_3d(self, context):
     """
         Draw all 3D ui for QuickSnap: Snap axis, edge/points highlight.
     """
+    try:
+        self.current_state  # a freed operator raises ReferenceError on any attribute access
+    except ReferenceError:
+        remove_draw_handlers()  # orphaned handler: unregister so it stops firing
+        return
     draw_snap_axis(self, context)
     # Cursor-local wireframe for heavy objects (instead of native show_wire).
     if getattr(self, "local_wire_objects", None):

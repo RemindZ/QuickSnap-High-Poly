@@ -227,6 +227,14 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         per (object, vertex) since the same candidates recur across mouse moves.
         """
         boost = np.zeros(len(object_ids), dtype=np.float64)
+        try:
+            self._fill_corner_boost(snapdata, object_ids, mesh_indices, spline_ids, boost)
+        except Exception as error:
+            # Corner bias is a non-essential enhancement; never let it break the snap query.
+            logger.debug(f"corner scoring skipped: {error}")
+        return boost
+
+    def _fill_corner_boost(self, snapdata, object_ids, mesh_indices, spline_ids, boost):
         for i in range(len(object_ids)):
             oid = int(object_ids[i])
             vid = int(mesh_indices[i])
@@ -854,8 +862,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
             if context.active_object is not None:
                 bpy.ops.object.mode_set(mode='EDIT')
             bpy.context.window.cursor_set("CROSSHAIR")
-        bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
-        bpy.types.SpaceView3D.draw_handler_remove(self._handle_3d, 'WINDOW')
+        quicksnap_render.remove_draw_handlers()
         self.snapdata_target.is_enabled = False
         context.window_manager.event_timer_remove(self._timer)
 
@@ -926,11 +933,11 @@ class QuickVertexSnapOperator(bpy.types.Operator):
 
         context.window.cursor_modal_set("DEFAULT")
 
-        args = (self, context)
-        self._handle = bpy.types.SpaceView3D.draw_handler_add(quicksnap_render.draw_callback_2d, args, 'WINDOW',
-                                                              'POST_PIXEL')
-        self._handle_3d = bpy.types.SpaceView3D.draw_handler_add(quicksnap_render.draw_callback_3d, args, 'WINDOW',
-                                                                 'POST_VIEW')
+        # Registered via the render module, which tracks the handles so an orphaned handler (if the
+        # operator is ever freed without terminate) can always be removed.
+        quicksnap_render.add_draw_handlers(self, context)
+        self._handle = None
+        self._handle_3d = None
         self._timer = context.window_manager.event_timer_add(0.005, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
