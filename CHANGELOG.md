@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.5.12
+
+### Fixed
+- Precision fit rebuilt for sculpted kit parts (organic surfaces, fur, shells
+  that overlap by design, with clean rectangular pegs for assembly). The fit
+  now only acts on clean mating faces: large, flat, direction-coherent contact
+  clusters whose normals oppose almost exactly. Rough organic contact and
+  designed shell overlaps are ignored entirely, and the correction is
+  restricted to the axes that opposing faces actually constrain, so insertion
+  depth always stays exactly where the snap put it. When no clean bilateral
+  feature is found near the snap, the part is not moved at all.
+
+### Added
+- QuickSnap panel in the 3D view sidebar (N panel) with the per-session
+  toggles: post-snap precision fit, prefer corners, hide dragged over target.
+- Holding middle mouse (orbit) now also pauses snapping and hides the dragged
+  objects, like Shift, so navigating around the target stays light and clear.
+
 ## 1.5.11
 
 ### Added
