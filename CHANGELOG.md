@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.10
+
+### Fixed
+- Precision fit no longer moves a part too far, e.g. carrying a key across the
+  slot until its left wall touches the lock's right wall. The fit now solves on
+  one robust value per mating face instead of per sample, so the balance
+  depends on the geometry rather than on how many samples happen to land on
+  each wall (uneven sampling used to drag the part towards the better-sampled
+  side). Faces close to where the user placed the part anchor the fit while
+  far matches (such as a neighboring identical slot) lose influence, and the
+  maximum correction is much tighter: the fit refines placement, it never
+  relocates the part.
+
 ## 1.5.9
 
 ### Fixed

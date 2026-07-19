@@ -162,7 +162,7 @@ def is_heavy_object(obj, settings=None, depsgraph=None):
 
 
 def compute_precision_fit(context, settings, object_names, target_object_name, contact_point,
-                          sample_count=300, iterations=8):
+                          sample_count=300, iterations=12):
     """
     Post-snap refinement: translation-only ICP between the moving objects' vertices around the
     snapped point and the target mesh surface. Sampling is anchored to the snapped point (the peg),
@@ -279,18 +279,62 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
         # A gap only constrains the fit when another surface opposes its direction: opposed gaps
         # get balanced by the solve (uniform air gap in a clearance fit), while unopposed gaps are
         # designed standoffs and are left alone. Penetration always constrains.
-        gap = err >= 0
-        opposed = (normals @ normals.T < -0.5).any(axis=1)
-        solve = ~gap | opposed
-        if solve.sum() < 8:
+        # Aggregate pairs into per-direction clusters (one per mating face) and fit on the robust
+        # median gap of each: the balance then depends on the geometry, not on how many samples
+        # happen to land on each wall, which would otherwise drag the part towards the
+        # better-sampled side.
+        reps = []
+        members = []
+        for i in range(len(err)):
+            for k in range(len(reps)):
+                if float(normals[i] @ reps[k]) > 0.9:
+                    members[k].append(i)
+                    break
+            else:
+                reps.append(normals[i].copy())
+                members.append([i])
+        cluster_err = []
+        cluster_n = []
+        for k in range(len(reps)):
+            errs_k = err[members[k]]
+            n_k = normals[members[k]].mean(axis=0)
+            length = float(np.linalg.norm(n_k))
+            if length == 0:
+                continue
+            n_k /= length
+            pens = errs_k[errs_k < 0]
+            if len(pens) >= 2:  # a face partially penetrating: resolve it
+                cluster_err.append(float(np.median(pens)))
+                cluster_n.append(n_k)
+            gaps = errs_k[errs_k >= 0]
+            if len(gaps) >= 2:
+                cluster_err.append(float(np.median(gaps)))
+                cluster_n.append(n_k)
+        if not cluster_err:
             return None
-        err = err[solve]
-        # Resolving penetration outranks closing a gap.
-        weights = np.where(err < 0, 3.0, 1.0)
-        rms_solve = float(np.sqrt((err ** 2).mean()))
-        return err, normals[solve], weights, rms_solve
+        cluster_err = np.array(cluster_err)
+        cluster_n = np.array(cluster_n)
 
-    max_correction = 0.75 * sample_radius
+        # A gap face only constrains the fit when another face opposes it; penetration always does.
+        gap = cluster_err >= 0
+        opposed = (cluster_n @ cluster_n.T < -0.5).any(axis=1)
+        solve = ~gap | opposed
+        if not solve.any():
+            return None
+        cluster_err = cluster_err[solve]
+        cluster_n = cluster_n[solve]
+
+        # The user already placed the part close: near faces anchor the fit, far matches (often a
+        # neighboring feature) lose influence smoothly. Opposed gaps still balance exactly.
+        sigma = max(2.0 * float(np.median(np.abs(cluster_err))), 0.05 * sample_radius)
+        weights = 1.0 / (1.0 + (cluster_err / sigma) ** 2)
+        # Resolving penetration outranks closing a gap.
+        weights[cluster_err < 0] *= 3.0
+        rms_solve = float(np.sqrt((cluster_err ** 2).mean()))
+        return cluster_err, cluster_n, weights, rms_solve
+
+    # Tight by design: the snap is assumed close, so the fit refines, it never relocates.
+    max_correction = 0.2 * sample_radius
     total = np.zeros(3)
     rms_start = None
     for _ in range(iterations):
