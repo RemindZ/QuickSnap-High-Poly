@@ -263,7 +263,7 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
 
         # Mating surfaces only: near the contact and genuinely facing each other.
         keep = ((qw - contact) ** 2).sum(axis=1) < (1.5 * sample_radius) ** 2
-        keep &= (point_normals[found_mask] * qnw).sum(axis=1) < -0.5
+        keep &= (point_normals[found_mask] * qnw).sum(axis=1) < -0.8  # true mating faces oppose almost exactly
         if keep.sum() < 8:
             return None
         err = ((pw[keep] - qw[keep]) * qnw[keep]).sum(axis=1)
@@ -296,33 +296,50 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
         cluster_err = []
         cluster_n = []
         for k in range(len(reps)):
+            if len(members[k]) < 10:
+                continue  # too few samples for a mating face (fur, stray matches)
             errs_k = err[members[k]]
             n_k = normals[members[k]].mean(axis=0)
             length = float(np.linalg.norm(n_k))
             if length == 0:
                 continue
             n_k /= length
-            pens = errs_k[errs_k < 0]
-            if len(pens) >= 2:  # a face partially penetrating: resolve it
-                cluster_err.append(float(np.median(pens)))
+            for part in (errs_k[errs_k < 0], errs_k[errs_k >= 0]):
+                if len(part) < 5:
+                    continue
+                med = float(np.median(part))
+                mad = float(np.median(np.abs(part - med)))
+                if mad > max(0.2 * abs(med), 0.005 * sample_radius):
+                    continue  # rough contact (organic surfaces), not a clean face
+                cluster_err.append(med)
                 cluster_n.append(n_k)
-            gaps = errs_k[errs_k >= 0]
-            if len(gaps) >= 2:
-                cluster_err.append(float(np.median(gaps)))
-                cluster_n.append(n_k)
-        if not cluster_err:
+        if len(cluster_err) < 2:
             return None
         cluster_err = np.array(cluster_err)
         cluster_n = np.array(cluster_n)
 
-        # A gap face only constrains the fit when another face opposes it; penetration always does.
-        gap = cluster_err >= 0
-        opposed = (cluster_n @ cluster_n.T < -0.5).any(axis=1)
-        solve = ~gap | opposed
-        if not solve.any():
+        # Corrections only along directions the mating feature constrains from BOTH sides (a wall
+        # with an opposing wall). One-sided contacts, whether gap or overlap, are by design on
+        # sculpted kit parts (nested shells, fur resting on surfaces) and are left alone.
+        dots = cluster_n @ cluster_n.T
+        opposed = (dots < -0.5).any(axis=1)
+        if not opposed.any():
             return None
-        cluster_err = cluster_err[solve]
-        cluster_n = cluster_n[solve]
+        # The correction is restricted to the span of the opposed pair axes. For slanted walls the
+        # pair axis is purely lateral (the normals' out-of-plane parts cancel), so insertion depth
+        # always stays where the user's snap put it.
+        axes = []
+        for i in range(len(cluster_n)):
+            for j in range(i + 1, len(cluster_n)):
+                if dots[i, j] < -0.5:
+                    axis = cluster_n[i] - cluster_n[j]
+                    axes.append(axis / np.linalg.norm(axis))
+        singular = np.linalg.svd(np.array(axes), full_matrices=False)
+        basis = singular[2][singular[1] > 0.5]
+        if len(basis) == 0:
+            return None
+        cluster_err = cluster_err[opposed]
+        cluster_n = cluster_n[opposed]
 
         # The user already placed the part close: near faces anchor the fit, far matches (often a
         # neighboring feature) lose influence smoothly. Opposed gaps still balance exactly.
@@ -331,7 +348,7 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
         # Resolving penetration outranks closing a gap.
         weights[cluster_err < 0] *= 3.0
         rms_solve = float(np.sqrt((cluster_err ** 2).mean()))
-        return cluster_err, cluster_n, weights, rms_solve
+        return cluster_err, cluster_n, weights, rms_solve, basis
 
     # Tight by design: the snap is assumed close, so the fit refines, it never relocates.
     max_correction = 0.2 * sample_radius
@@ -341,7 +358,7 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
         pairs = fit_pairs(total)
         if pairs is None:
             break
-        err, normals, weights, rms_solve = pairs
+        err, normals, weights, rms_solve, basis = pairs
         if rms_start is None:
             rms_start = rms_solve
         # Damped least squares: unconstrained axes stay put instead of drifting.
@@ -349,6 +366,7 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
         a = wn.T @ normals
         a += np.eye(3) * max(1e-4 * np.trace(a) / 3.0, 1e-12)
         step = np.linalg.solve(a, -(wn * err[:, None]).sum(axis=0))
+        step = basis.T @ (basis @ step)  # keep the correction on the bilaterally constrained axes
         total += step
         dist = float(np.linalg.norm(total))
         if dist > max_correction:
