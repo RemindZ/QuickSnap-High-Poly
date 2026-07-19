@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.11
+
+### Added
+- Hold Shift after picking the source point to pause snapping: nothing under
+  the cursor is loaded, searched or highlighted while held, so the mouse stays
+  light around dense targets, and the dragged objects stay hidden (with the
+  hide option on) so the target's interior is visible. Release Shift to resume
+  snapping; the header shows when snapping is paused.
+
 ## 1.5.10
 
 ### Fixed

@@ -102,6 +102,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self._corner_cache = {}
         self.perf_wire_ms = 0.0
         self.selection_hidden = False
+        self.snap_paused = False
         self.no_selection_target = None
         self.ignore_modifiers = self.settings.ignore_modifiers
         self.target_face_index = -1
@@ -415,8 +416,16 @@ class QuickVertexSnapOperator(bpy.types.Operator):
                 bpy.context.window.cursor_set("CROSSHAIR")
 
         elif self.current_state == State.SOURCE_PICKED:
+            if self.snap_paused:
+                # Shift held: no raycast, no loading, no closest-point search. The selection
+                # free-follows the mouse so the user can look around and position cheaply.
+                self.closest_target_id = -1
+                self.closest_vertexid = -1
+                self.distance = -1
+                if self.target_object != "" or self.hover_object != "":
+                    self.set_object_display("", "")
             # If we are only snapping to origins, only search through origin points.
-            if self.snapdata_target.snap_type == 'ORIGINS':
+            elif self.snapdata_target.snap_type == 'ORIGINS':
                 closest = self.snapdata_target.find_closest(mouse_coord_screen_flat, search_origins_only=True)
                 if closest is not None:
                     (self.closest_target_id, self.distance, target_object_name, is_root, mesh_vertid) = closest
@@ -459,10 +468,11 @@ class QuickVertexSnapOperator(bpy.types.Operator):
                     self.distance = -1
                     self.set_object_display("", hover_object)
 
-            # Hide the moving objects while the mouse is over another object, so the target
-            # geometry is unobstructed; they reappear as soon as the mouse leaves it.
+            # Hide the moving objects while the mouse is over another object or while snapping is
+            # paused (Shift), so the target geometry is unobstructed; they reappear as soon as the
+            # mouse leaves the target / Shift is released.
             if self.settings.hide_selection_over_target:
-                self.set_selection_hidden(hover_object != "")
+                self.set_selection_hidden(hover_object != "" or self.snap_paused)
 
 
     def apply(self, context, region, use_auto_merge=False):
@@ -540,6 +550,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self._corner_cache = {}
         self.perf_wire_ms = 0.0
         self.selection_hidden = False
+        self.snap_paused = False
         self.target_bounds = None
         self.source_highlight_data = None
         self.source_allowed_indices = None
@@ -620,6 +631,9 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         if event.type not in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
                                                                    'TIMER'}:
             self.refresh_vertex_data(context, region)
+            # Holding Shift after the source pick pauses target evaluation: the selection follows
+            # the mouse freely and nothing under the cursor gets loaded or searched.
+            self.snap_paused = event.shift and self.current_state == State.SOURCE_PICKED
         snapdata_updated = False
         if self.current_state == State.IDLE:
             ti = time.perf_counter()
@@ -629,7 +643,7 @@ class QuickVertexSnapOperator(bpy.types.Operator):
                 ti = time.perf_counter()
                 snapdata_updated = snapdata_updated or self.snapdata_target.process_iteration(context)
                 self.snapdata_target.processing_time_total += time.perf_counter() - ti
-        else:
+        elif not self.snap_paused:
             ti = time.perf_counter()
             snapdata_updated = snapdata_updated or self.snapdata_target.process_iteration(context)
             self.snapdata_target.processing_time_total += time.perf_counter() - ti
@@ -918,6 +932,8 @@ class QuickVertexSnapOperator(bpy.types.Operator):
                 axis_msg = "(World)"
         if self.settings.ignore_modifiers:
             ignore_modifiers_msg = " [MODIFIERS ARE IGNORED]"
+        if self.snap_paused:
+            ignore_modifiers_msg = f"{ignore_modifiers_msg} [SNAPPING PAUSED (Shift held)]"
         if self.current_state == State.IDLE:
             context.area.header_text_set(f"QuickSnap: Pick the source vertex/point. {snapping_msg}{axis_msg} "
                                          f"{ignore_modifiers_msg}")
