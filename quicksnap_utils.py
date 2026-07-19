@@ -267,19 +267,28 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
         if keep.sum() < 8:
             return None
         err = ((pw[keep] - qw[keep]) * qnw[keep]).sum(axis=1)
+        normals = qnw[keep]
 
-        # Gaps can be by design (clearances, shoulders); penetration never is. Trim gap errors
-        # hard so designed offsets cannot pull an aligned part, keep penetrations generously.
-        med = np.median(np.abs(err))
-        gap_floor = max(3.0 * med, 0.02 * sample_radius)
-        pen_floor = max(3.0 * med, 0.15 * sample_radius)
-        trim = np.abs(err) <= np.where(err >= 0, gap_floor, pen_floor)
-        if trim.sum() < 8:
+        # Magnitude sanity only; designed clearances are handled by the opposition rule below.
+        sane = np.where(err >= 0, err <= 0.3 * sample_radius, err >= -0.15 * sample_radius)
+        if sane.sum() < 8:
             return None
-        err = err[trim]
-        # Resolving penetration outranks closing a (possibly designed) gap.
+        err = err[sane]
+        normals = normals[sane]
+
+        # A gap only constrains the fit when another surface opposes its direction: opposed gaps
+        # get balanced by the solve (uniform air gap in a clearance fit), while unopposed gaps are
+        # designed standoffs and are left alone. Penetration always constrains.
+        gap = err >= 0
+        opposed = (normals @ normals.T < -0.5).any(axis=1)
+        solve = ~gap | opposed
+        if solve.sum() < 8:
+            return None
+        err = err[solve]
+        # Resolving penetration outranks closing a gap.
         weights = np.where(err < 0, 3.0, 1.0)
-        return err, qnw[keep][trim], weights
+        rms_solve = float(np.sqrt((err ** 2).mean()))
+        return err, normals[solve], weights, rms_solve
 
     max_correction = 0.75 * sample_radius
     total = np.zeros(3)
@@ -288,17 +297,9 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
         pairs = fit_pairs(total)
         if pairs is None:
             break
-        err, normals, weights = pairs
+        err, normals, weights, rms_solve = pairs
         if rms_start is None:
-            rms_start = float(np.sqrt((err ** 2).mean()))
-            # A coherent one-sided standoff (no penetration, uniform gap, single surface
-            # orientation) is indistinguishable from a designed offset: leave the snap exact.
-            # Multi-orientation gaps (e.g. slanted walls) still seat normally.
-            if err.min() >= 0:
-                mean_gap = float(err.mean())
-                one_plane = float(np.linalg.norm(normals.mean(axis=0))) > 0.95
-                if one_plane and float(err.std()) < 0.15 * max(mean_gap, 1e-12):
-                    return None
+            rms_start = rms_solve
         # Damped least squares: unconstrained axes stay put instead of drifting.
         wn = normals * weights[:, None]
         a = wn.T @ normals
@@ -312,14 +313,14 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
         if float(np.linalg.norm(step)) < 1e-4 * sample_radius:
             break
 
-    # Only move when it clearly seats better: an already aligned snap must stay put.
+    # Safety check, not an improvement demand: balancing a clearance barely moves the rms (the
+    # designed gap stays), so only reject corrections that leave the parts sitting worse.
     if rms_start is None or float(np.linalg.norm(total)) < 0.002 * sample_radius:
         return None
     pairs = fit_pairs(total)
     if pairs is None:
         return None
-    rms_end = float(np.sqrt((pairs[0] ** 2).mean()))
-    if rms_end >= 0.8 * rms_start:
+    if pairs[3] > rms_start * 1.02:
         return None
     return Vector(total)
 

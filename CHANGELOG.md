@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.8
+
+### Fixed
+- Precision fit now handles parts with built-in tolerances (a designed air gap
+  between key and lock) correctly: the part is centered so the gap is even on
+  all sides, instead of sometimes being pushed against a wall. A gap now only
+  constrains the fit when another surface opposes its direction: opposed gaps
+  are balanced, unopposed gaps are treated as designed standoffs and left
+  alone, and penetration always resolves. The final check is a safety check
+  (reject corrections that leave the parts sitting worse) rather than an
+  improvement demand, since balancing a clearance barely changes the total
+  error while clearly improving the fit.
+
 ## 1.5.7
 
 ### Fixed
