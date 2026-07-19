@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.9
+
+### Fixed
+- Settings now survive version upgrades. Blender wipes addon preferences when
+  an addon is removed, and keys them to the install folder name, so upgrading
+  via remove+install (or installing a differently named zip) lost all settings.
+  The addon now backs its preferences up to quicksnap_settings.json in
+  Blender's config folder (on every tool session end and on disable) and
+  restores them when enabled, so settings persist across reinstalls, renamed
+  installs and Blender upgrades.
+
 ## 1.5.8
 
 ### Fixed

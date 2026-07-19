@@ -1,8 +1,10 @@
 ﻿import time
 import bmesh
 import bpy
+import json
 import logging
 import numpy as np
+import os
 from mathutils import Vector
 
 from . import quicksnap_render
@@ -891,6 +893,10 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.local_wire_data = {}
         self._heavy_cache = {}
         self._corner_cache = {}
+        try:
+            save_settings()  # keep the settings backup fresh even if Blender never unregisters
+        except Exception:
+            pass
 
     def update_mouse_position(self, context, event):
         self.mouse_position = (event.mouse_region_x, event.mouse_region_y)
@@ -1322,9 +1328,79 @@ blender_classes = [
 ]
 
 
+def settings_file_path():
+    """Path of the settings backup, independent of the addon's module name and install."""
+    config_dir = bpy.utils.user_resource('CONFIG')
+    if not config_dir:
+        return None
+    return os.path.join(config_dir, "quicksnap_settings.json")
+
+
+def save_settings():
+    """
+    Back up the addon preferences to a json in Blender's config folder. Blender wipes preferences
+    when an addon is removed (and keys them to the module name), so without this a version upgrade
+    done as remove+install, or installed under another folder name, loses all settings.
+    """
+    settings = quicksnap_utils.get_addon_settings()
+    path = settings_file_path()
+    if settings is None or path is None:
+        return
+    data = {}
+    for prop in settings.bl_rna.properties:
+        key = prop.identifier
+        if key in {'rna_type', 'bl_idname'} or prop.is_readonly:
+            continue
+        value = getattr(settings, key)
+        try:
+            json.dumps(value)
+        except TypeError:
+            try:
+                value = list(value)
+            except TypeError:
+                continue
+        data[key] = value
+    try:
+        with open(path, 'w') as settings_file:
+            json.dump(data, settings_file, indent=1)
+    except OSError as error:
+        logger.debug(f"Could not save settings backup: {error}")
+
+
+def load_settings():
+    """Restore preferences from the backup (fresh installs and renamed installs pick them up)."""
+    settings = quicksnap_utils.get_addon_settings()
+    path = settings_file_path()
+    if settings is None or path is None or not os.path.isfile(path):
+        return
+    try:
+        with open(path) as settings_file:
+            data = json.load(settings_file)
+    except (OSError, ValueError) as error:
+        logger.debug(f"Could not read settings backup: {error}")
+        return
+    for key, value in data.items():
+        if key in {'rna_type', 'bl_idname'}:
+            continue
+        try:
+            setattr(settings, key, value)
+        except Exception:
+            pass  # property removed or renamed in this version
+
+
+def _load_settings_deferred():
+    load_settings()
+    return None
+
+
 def register():
     for blender_class in blender_classes:
         bpy.utils.register_class(blender_class)
+    # Preferences are not accessible yet while the addon is still enabling; restore right after.
+    try:
+        bpy.app.timers.register(_load_settings_deferred, first_interval=0.2)
+    except Exception:
+        pass
     window_manager = bpy.context.window_manager
     key_config = window_manager.keyconfigs.addon
     if key_config:
@@ -1335,6 +1411,10 @@ def register():
 
 
 def unregister():
+    try:
+        save_settings()  # while the preferences still exist
+    except Exception:
+        pass
     for (cat, key) in addon_keymaps:
         cat.keymap_items.remove(key)
     addon_keymaps.clear()
