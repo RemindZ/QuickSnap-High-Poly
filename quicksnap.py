@@ -720,6 +720,12 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         # Allow navigation
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
             self.update_mouse_position(context, event)
+            if event.type == 'MIDDLEMOUSE' and self.current_state == State.SOURCE_PICKED:
+                # Orbiting: pause snapping and keep the dragged objects out of the view. The next
+                # mouse move after the orbit re-evaluates and unhides as usual.
+                self.snap_paused = True
+                if self.settings.hide_selection_over_target:
+                    self.set_selection_hidden(True)
             return {'PASS_THROUGH'}
 
         return {'RUNNING_MODAL'}
@@ -1336,10 +1342,28 @@ class QUICKSNAP_OT_OpenSettings(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class QUICKSNAP_PT_toolbar(bpy.types.Panel):
+    """Quick access to the per-session workflow toggles, in the 3D view sidebar (N panel)."""
+    bl_label = "QuickSnap"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "QuickSnap"
+
+    def draw(self, context):
+        settings = get_addon_settings()
+        if settings is None:
+            return
+        col = self.layout.column()
+        col.prop(settings, "precision_fit", text="Post-snap precision fit")
+        col.prop(settings, "corner_snapping", text="Prefer corners")
+        col.prop(settings, "hide_selection_over_target", text="Hide dragged over target")
+
+
 blender_classes = [
     QuickVertexSnapOperator,
     QuickVertexSnapPreference,
     QUICKSNAP_OT_OpenSettings,
+    QUICKSNAP_PT_toolbar,
     VIEW3D_MT_PIE_quicksnap
 ]
 
