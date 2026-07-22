@@ -379,235 +379,174 @@ def _candidate_patches(mesh_data, seed_polygons):
     return sorted(patches.values(), key=_patch_sort_key)
 
 
+def _plane_pairs(patches, contact):
+    opposed_limit = math.cos(math.radians(170.0))
+    pairs = []
+    for i, first in enumerate(patches):
+        for second in patches[i + 1:]:
+            if float(first['normal'] @ second['normal']) > opposed_limit:
+                continue
+            axis = first['normal'] - second['normal']
+            length = float(np.linalg.norm(axis))
+            if length == 0:
+                continue
+            axis /= length
+            dominant = int(np.argmax(np.abs(axis)))
+            if axis[dominant] < 0:
+                axis *= -1.0
+            first_d = float(axis @ first['point'])
+            second_d = float(axis @ second['point'])
+            if first_d <= second_d:
+                low, high = first, second
+                low_d, high_d = first_d, second_d
+            else:
+                low, high = second, first
+                low_d, high_d = second_d, first_d
+            tolerance = first['tolerance'] + second['tolerance']
+            separation = high_d - low_d
+            contact_d = float(axis @ contact)
+            if separation <= tolerance:
+                continue
+            if contact_d < low_d - tolerance or contact_d > high_d + tolerance:
+                continue
+            pairs.append({
+                'axis': axis,
+                'low_patch': low,
+                'high_patch': high,
+                'low': low_d,
+                'high': high_d,
+                'mid': 0.5 * (low_d + high_d),
+                'center': 0.5 * (low['point'] + high['point']),
+                'separation': separation,
+                'tolerance': tolerance,
+            })
+    return sorted(pairs, key=lambda pair: tuple(np.round(pair['axis'], 9)) + (round(pair['mid'], 9),))
+
+
+def _match_plane_pairs(source_pairs, target_pairs, contact):
+    opposed_limit = math.cos(math.radians(170.0))
+    matches = []
+    for source in source_pairs:
+        candidates = []
+        for target in target_pairs:
+            if float(source['axis'] @ target['axis']) < _FIT_COS_5:
+                continue
+            if float(source['low_patch']['normal'] @ target['low_patch']['normal']) > opposed_limit:
+                continue
+            if float(source['high_patch']['normal'] @ target['high_patch']['normal']) > opposed_limit:
+                continue
+            tolerance = source['tolerance'] + target['tolerance']
+            clearance = target['separation'] - source['separation']
+            if clearance <= tolerance:
+                continue
+            delta = target['mid'] - source['mid']
+            if abs(delta) > min(0.25 * source['separation'], 2.0 * clearance) + tolerance:
+                continue
+            distance = float(np.linalg.norm(target['center'] - contact))
+            candidates.append((distance, tolerance, target, clearance, delta))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda item: item[0])
+        if len(candidates) > 1 and candidates[1][0] - candidates[0][0] <= max(candidates[0][1], candidates[1][1]):
+            continue
+        _, tolerance, target, clearance, delta = candidates[0]
+        matches.append({
+            'axis': source['axis'],
+            'source': source,
+            'target': target,
+            'clearance': clearance,
+            'delta': delta,
+            'tolerance': tolerance,
+        })
+
+    independent = []
+    for match in sorted(matches, key=lambda item: tuple(np.round(item['axis'], 9))):
+        if any(abs(float(match['axis'] @ other['axis'])) >= _FIT_COS_5 for other in independent):
+            continue
+        independent.append(match)
+    return independent
+
+
+def _solve_pair_translation(matches):
+    if not matches:
+        return None
+    axes = np.array([match['axis'] for match in matches], dtype=np.float64)
+    deltas = np.array([match['delta'] for match in matches], dtype=np.float64)
+    try:
+        translation = np.linalg.lstsq(axes, deltas, rcond=0.1)[0]
+        _, singular, vh = np.linalg.svd(axes, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    if len(singular) == 0 or singular[0] <= 0:
+        return None
+    basis = vh[singular >= 0.1 * singular[0]]
+    if len(basis) == 0:
+        return None
+    translation = basis.T @ (basis @ translation)
+    scale = max(match['target']['separation'] for match in matches)
+    if not np.isfinite(translation).all() or float(np.linalg.norm(translation)) <= 1e-12 * scale:
+        return None
+    return translation
+
+
+def _validate_pair_translation(matches, translation):
+    for match in matches:
+        source = match['source']
+        target = match['target']
+        shift = float(match['axis'] @ translation)
+        low_before = source['low'] - target['low']
+        high_before = target['high'] - source['high']
+        low_after = source['low'] + shift - target['low']
+        high_after = target['high'] - source['high'] - shift
+        tolerance = match['tolerance']
+        if low_after < -tolerance or high_after < -tolerance:
+            return False
+        if abs(low_after - high_after) >= abs(low_before - high_before):
+            return False
+        if abs(low_after - high_after) > tolerance:
+            return False
+    return True
+
+
 def compute_precision_fit(context, settings,
                           source_object_name, source_snap_type, source_element_index,
                           target_object_name, target_snap_type, target_element_index,
                           contact_point):
-    """
-    Post-snap refinement: translation-only ICP between the moving objects' vertices around the
-    snapped point and the target mesh surface. Sampling is anchored to the snapped point (the peg),
-    matches are kept only near the contact area (the hole) and only between surfaces facing each
-    other, so complex geometry around the mating features does not pull the fit.
-    Returns a world-space correction Vector, or None when there is nothing reliable to fit.
-    """
-    object_names = [source_object_name]
-    sample_count = 300
-    iterations = 12
+    """Center clean opposed plane pairs seeded by the user's source and target snap elements."""
+    source_obj = bpy.data.objects.get(source_object_name)
     target_obj = bpy.data.objects.get(target_object_name)
-    if target_obj is None or target_obj.type != 'MESH':
+    if source_obj is None or target_obj is None or source_obj.type != 'MESH' or target_obj.type != 'MESH':
+        logger.debug("Precision fit skipped: source or target mesh is unavailable")
         return None
     depsgraph = context.evaluated_depsgraph_get()
-    target_eval = target_obj if settings.ignore_modifiers else target_obj.evaluated_get(depsgraph)
-    if len(target_eval.data.polygons) == 0:
+    ignore_modifiers = getattr(settings, 'ignore_modifiers', False)
+    source_fit = source_obj if ignore_modifiers else source_obj.evaluated_get(depsgraph)
+    target_fit = target_obj if ignore_modifiers else target_obj.evaluated_get(depsgraph)
+    if len(source_fit.data.polygons) == 0 or len(target_fit.data.polygons) == 0:
+        logger.debug("Precision fit skipped: source or target mesh is empty")
         return None
 
     contact = np.array(contact_point, dtype=np.float64)
-
-    # Sample vertices of the moving objects, nearest to the snapped point, with world normals.
-    sample_co = []
-    sample_no = []
-    sample_d2 = []
-    for name in object_names:
-        obj = bpy.data.objects.get(name)
-        if obj is None or obj.type != 'MESH':
-            continue
-        data_obj = obj if settings.ignore_modifiers else obj.evaluated_get(depsgraph)
-        data = data_obj.data
-        count = len(data.vertices)
-        if count == 0:
-            continue
-        # Rank in float32 object space (matches Blender's storage, so foreach_get bulk-copies, and
-        # skips a full-mesh world transform); only the selected samples go to float64 world space.
-        co = np.empty(count * 3, dtype=np.float32)
-        data.vertices.foreach_get('co', co)
-        co.shape = (count, 3)
-        matrix = np.array(data_obj.matrix_world, dtype=np.float64)
-        inv_m = np.array(data_obj.matrix_world.inverted(), dtype=np.float64)
-        contact_local = (inv_m[:3, :3] @ contact + inv_m[:3, 3]).astype(np.float32)
-        diff = co - contact_local
-        d2_local = np.einsum('ij,ij->i', diff, diff)
-        keep = min(sample_count, count)
-        sel = np.argpartition(d2_local, keep - 1)[:keep]
-        world = co[sel].astype(np.float64) @ matrix[:3, :3].T + matrix[:3, 3]
-        d2 = ((world - contact) ** 2).sum(axis=1)
-        normals = np.empty((keep, 3), dtype=np.float64)
-        verts = data.vertices
-        for i, vid in enumerate(sel):
-            normals[i] = verts[int(vid)].normal[:]
-        # Normals transform by the inverse-transpose, so non-uniform scale stays correct.
-        normals = normals @ inv_m[:3, :3]
-        lengths = np.linalg.norm(normals, axis=1)
-        lengths[lengths == 0] = 1
-        sample_co.append(world)
-        sample_no.append(normals / lengths[:, None])
-        sample_d2.append(d2)
-    if not sample_co:
+    source_data = _mesh_fit_data(source_fit)
+    target_data = _mesh_fit_data(target_fit)
+    source_seeds = _seed_polygons(source_data, source_snap_type, source_element_index)
+    target_seeds = _seed_polygons(target_data, target_snap_type, target_element_index)
+    if not source_seeds or not target_seeds:
+        logger.debug("Precision fit skipped: snap element is stale or unsupported")
         return None
-    points = np.concatenate(sample_co)
-    point_normals = np.concatenate(sample_no)
-    d2 = np.concatenate(sample_d2)
-    if len(points) > sample_count:
-        sel = np.argpartition(d2, sample_count - 1)[:sample_count]
-        points, point_normals, d2 = points[sel], point_normals[sel], d2[sel]
-    if len(points) < 16:
+    source_patches = _candidate_patches(source_data, source_seeds)
+    target_patches = _candidate_patches(target_data, target_seeds)
+    source_pairs = _plane_pairs(source_patches, contact)
+    target_pairs = _plane_pairs(target_patches, contact)
+    matches = _match_plane_pairs(source_pairs, target_pairs, contact)
+    translation = _solve_pair_translation(matches)
+    if translation is None:
+        logger.debug("Precision fit skipped: no unambiguous clearance pair")
         return None
-    sample_radius = float(np.sqrt(d2.max()))
-    if sample_radius <= 0:
+    if not _validate_pair_translation(matches, translation):
+        logger.debug("Precision fit skipped: proposed translation failed pair validation")
         return None
-
-    matrix_t = np.array(target_obj.matrix_world, dtype=np.float64)
-    inv_t = np.array(target_obj.matrix_world.inverted(), dtype=np.float64)
-    # Approximate world->local scale, to express search distances in the target's local space.
-    inv_scale = float(np.mean(np.linalg.norm(inv_t[:3, :3], axis=0)))
-    search_local = 2.0 * sample_radius * inv_scale
-    closest = target_eval.closest_point_on_mesh
-
-    def fit_pairs(offset):
-        """Nearest-surface pairs at points+offset, filtered to plausible mating surfaces."""
-        local = (points + offset) @ inv_t[:3, :3].T + inv_t[:3, 3]
-        q = np.empty_like(points)
-        qn = np.empty_like(points)
-        found_mask = np.zeros(len(points), dtype=bool)
-        for i in range(len(points)):
-            found, location, normal, _ = closest(Vector(local[i]), distance=search_local)
-            if found:
-                q[i] = location[:]
-                qn[i] = normal[:]
-                found_mask[i] = True
-        if found_mask.sum() < 8:
-            return None
-        qw = q[found_mask] @ matrix_t[:3, :3].T + matrix_t[:3, 3]
-        # Normals transform by the inverse-transpose, so non-uniform scale stays correct.
-        qnw = qn[found_mask] @ inv_t[:3, :3]
-        lengths = np.linalg.norm(qnw, axis=1)
-        lengths[lengths == 0] = 1
-        qnw /= lengths[:, None]
-        pw = points[found_mask] + offset
-
-        # Mating surfaces only: near the contact and genuinely facing each other.
-        keep = ((qw - contact) ** 2).sum(axis=1) < (1.5 * sample_radius) ** 2
-        keep &= (point_normals[found_mask] * qnw).sum(axis=1) < -0.8  # true mating faces oppose almost exactly
-        if keep.sum() < 8:
-            return None
-        err = ((pw[keep] - qw[keep]) * qnw[keep]).sum(axis=1)
-        normals = qnw[keep]
-
-        # Magnitude sanity only; designed clearances are handled by the opposition rule below.
-        sane = np.where(err >= 0, err <= 0.3 * sample_radius, err >= -0.15 * sample_radius)
-        if sane.sum() < 8:
-            return None
-        err = err[sane]
-        normals = normals[sane]
-
-        # A gap only constrains the fit when another surface opposes its direction: opposed gaps
-        # get balanced by the solve (uniform air gap in a clearance fit), while unopposed gaps are
-        # designed standoffs and are left alone. Penetration always constrains.
-        # Aggregate pairs into per-direction clusters (one per mating face) and fit on the robust
-        # median gap of each: the balance then depends on the geometry, not on how many samples
-        # happen to land on each wall, which would otherwise drag the part towards the
-        # better-sampled side.
-        reps = []
-        members = []
-        for i in range(len(err)):
-            for k in range(len(reps)):
-                if float(normals[i] @ reps[k]) > 0.9:
-                    members[k].append(i)
-                    break
-            else:
-                reps.append(normals[i].copy())
-                members.append([i])
-        cluster_err = []
-        cluster_n = []
-        for k in range(len(reps)):
-            if len(members[k]) < 10:
-                continue  # too few samples for a mating face (fur, stray matches)
-            errs_k = err[members[k]]
-            n_k = normals[members[k]].mean(axis=0)
-            length = float(np.linalg.norm(n_k))
-            if length == 0:
-                continue
-            n_k /= length
-            for part in (errs_k[errs_k < 0], errs_k[errs_k >= 0]):
-                if len(part) < 5:
-                    continue
-                med = float(np.median(part))
-                mad = float(np.median(np.abs(part - med)))
-                if mad > max(0.2 * abs(med), 0.005 * sample_radius):
-                    continue  # rough contact (organic surfaces), not a clean face
-                cluster_err.append(med)
-                cluster_n.append(n_k)
-        if len(cluster_err) < 2:
-            return None
-        cluster_err = np.array(cluster_err)
-        cluster_n = np.array(cluster_n)
-
-        # Corrections only along directions the mating feature constrains from BOTH sides (a wall
-        # with an opposing wall). One-sided contacts, whether gap or overlap, are by design on
-        # sculpted kit parts (nested shells, fur resting on surfaces) and are left alone.
-        dots = cluster_n @ cluster_n.T
-        opposed = (dots < -0.5).any(axis=1)
-        if not opposed.any():
-            return None
-        # The correction is restricted to the span of the opposed pair axes. For slanted walls the
-        # pair axis is purely lateral (the normals' out-of-plane parts cancel), so insertion depth
-        # always stays where the user's snap put it.
-        axes = []
-        for i in range(len(cluster_n)):
-            for j in range(i + 1, len(cluster_n)):
-                if dots[i, j] < -0.5:
-                    axis = cluster_n[i] - cluster_n[j]
-                    axes.append(axis / np.linalg.norm(axis))
-        singular = np.linalg.svd(np.array(axes), full_matrices=False)
-        basis = singular[2][singular[1] > 0.5]
-        if len(basis) == 0:
-            return None
-        cluster_err = cluster_err[opposed]
-        cluster_n = cluster_n[opposed]
-
-        # The user already placed the part close: near faces anchor the fit, far matches (often a
-        # neighboring feature) lose influence smoothly. Opposed gaps still balance exactly.
-        sigma = max(2.0 * float(np.median(np.abs(cluster_err))), 0.05 * sample_radius)
-        weights = 1.0 / (1.0 + (cluster_err / sigma) ** 2)
-        # Resolving penetration outranks closing a gap.
-        weights[cluster_err < 0] *= 3.0
-        rms_solve = float(np.sqrt((cluster_err ** 2).mean()))
-        return cluster_err, cluster_n, weights, rms_solve, basis
-
-    # Tight by design: the snap is assumed close, so the fit refines, it never relocates.
-    max_correction = 0.2 * sample_radius
-    total = np.zeros(3)
-    rms_start = None
-    for _ in range(iterations):
-        pairs = fit_pairs(total)
-        if pairs is None:
-            break
-        err, normals, weights, rms_solve, basis = pairs
-        if rms_start is None:
-            rms_start = rms_solve
-        # Damped least squares: unconstrained axes stay put instead of drifting.
-        wn = normals * weights[:, None]
-        a = wn.T @ normals
-        a += np.eye(3) * max(1e-4 * np.trace(a) / 3.0, 1e-12)
-        step = np.linalg.solve(a, -(wn * err[:, None]).sum(axis=0))
-        step = basis.T @ (basis @ step)  # keep the correction on the bilaterally constrained axes
-        total += step
-        dist = float(np.linalg.norm(total))
-        if dist > max_correction:
-            total *= max_correction / dist
-            break
-        if float(np.linalg.norm(step)) < 1e-4 * sample_radius:
-            break
-
-    # Safety check, not an improvement demand: balancing a clearance barely moves the rms (the
-    # designed gap stays), so only reject corrections that leave the parts sitting worse.
-    if rms_start is None or float(np.linalg.norm(total)) < 0.002 * sample_radius:
-        return None
-    pairs = fit_pairs(total)
-    if pairs is None:
-        return None
-    if pairs[3] > rms_start * 1.02:
-        return None
-    return Vector(total)
+    return Vector(tuple(float(value) for value in translation))
 
 
 def get_axis_target(origin, target, axis_constraint, obj=None):
