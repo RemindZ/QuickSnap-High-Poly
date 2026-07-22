@@ -1,6 +1,7 @@
 ﻿import bpy, mathutils, logging
 from mathutils import Vector
 from enum import Enum
+import math
 from bpy_extras import view3d_utils
 import numpy as np
 
@@ -159,6 +160,223 @@ def is_heavy_object(obj, settings=None, depsgraph=None):
     if getattr(settings, "ignore_modifiers", False):
         depsgraph = None
     return get_object_vertex_count(obj, depsgraph) >= settings.heavy_mesh_threshold * 1000
+
+
+_FIT_COS_5 = math.cos(math.radians(5.0))
+_FIT_ABS_TOL = 1e-7
+
+
+def _mesh_fit_data(obj):
+    mesh = obj.data
+    vertex_count = len(mesh.vertices)
+    polygon_count = len(mesh.polygons)
+    loop_count = len(mesh.loops)
+    edge_count = len(mesh.edges)
+
+    vertices = np.empty(vertex_count * 3, dtype=np.float64)
+    mesh.vertices.foreach_get('co', vertices)
+    vertices.shape = (vertex_count, 3)
+    matrix = np.array(obj.matrix_world, dtype=np.float64)
+    inverse = np.array(obj.matrix_world.inverted(), dtype=np.float64)
+    vertices = vertices @ matrix[:3, :3].T + matrix[:3, 3]
+
+    loop_vertices = np.empty(loop_count, dtype=np.int32)
+    loop_edges = np.empty(loop_count, dtype=np.int32)
+    mesh.loops.foreach_get('vertex_index', loop_vertices)
+    mesh.loops.foreach_get('edge_index', loop_edges)
+
+    loop_starts = np.empty(polygon_count, dtype=np.int32)
+    loop_totals = np.empty(polygon_count, dtype=np.int32)
+    centers = np.empty(polygon_count * 3, dtype=np.float64)
+    normals = np.empty(polygon_count * 3, dtype=np.float64)
+    mesh.polygons.foreach_get('loop_start', loop_starts)
+    mesh.polygons.foreach_get('loop_total', loop_totals)
+    mesh.polygons.foreach_get('center', centers)
+    mesh.polygons.foreach_get('normal', normals)
+    centers.shape = (polygon_count, 3)
+    normals.shape = (polygon_count, 3)
+    centers = centers @ matrix[:3, :3].T + matrix[:3, 3]
+    normals = normals @ inverse[:3, :3]
+    lengths = np.linalg.norm(normals, axis=1)
+    lengths[lengths == 0] = 1.0
+    normals /= lengths[:, None]
+
+    edge_vertices = np.empty(edge_count * 2, dtype=np.int32)
+    mesh.edges.foreach_get('vertices', edge_vertices)
+    edge_vertices.shape = (edge_count, 2)
+    edge_lengths = np.linalg.norm(vertices[edge_vertices[:, 0]] - vertices[edge_vertices[:, 1]], axis=1)
+
+    loop_polygons = np.repeat(np.arange(polygon_count, dtype=np.int32), loop_totals)
+    edge_order = np.argsort(loop_edges, kind='stable')
+    edge_counts = np.bincount(loop_edges, minlength=edge_count)
+    edge_starts = np.concatenate(([0], np.cumsum(edge_counts)))
+
+    return {
+        'mesh': mesh,
+        'vertices': vertices,
+        'loop_vertices': loop_vertices,
+        'loop_edges': loop_edges,
+        'loop_starts': loop_starts,
+        'loop_totals': loop_totals,
+        'loop_polygons': loop_polygons,
+        'polygon_centers': centers,
+        'polygon_normals': normals,
+        'edge_lengths': edge_lengths,
+        'edge_polygons': loop_polygons[edge_order],
+        'edge_starts': edge_starts,
+        'polygon_geometry': {},
+        'polygon_patches': {},
+    }
+
+
+def _seed_polygons(mesh_data, snap_type, element_index):
+    if element_index < 0:
+        return []
+    if snap_type == 'POINTS' and element_index < len(mesh_data['vertices']):
+        mask = mesh_data['loop_vertices'] == element_index
+        return np.unique(mesh_data['loop_polygons'][mask]).tolist()
+    if snap_type == 'MIDPOINTS' and element_index < len(mesh_data['edge_lengths']):
+        mask = mesh_data['loop_edges'] == element_index
+        return np.unique(mesh_data['loop_polygons'][mask]).tolist()
+    if snap_type == 'FACES' and element_index < len(mesh_data['loop_starts']):
+        return [element_index]
+    return []
+
+
+def _polygon_geometry(mesh_data, polygon_index):
+    cached = mesh_data['polygon_geometry'].get(polygon_index)
+    if cached is not None:
+        return cached
+    start = int(mesh_data['loop_starts'][polygon_index])
+    total = int(mesh_data['loop_totals'][polygon_index])
+    vertex_indices = mesh_data['loop_vertices'][start:start + total]
+    coordinates = mesh_data['vertices'][vertex_indices]
+    if len(coordinates) < 3:
+        area = 0.0
+    else:
+        triangles = np.cross(coordinates[1:-1] - coordinates[0], coordinates[2:] - coordinates[0])
+        area = 0.5 * float(np.linalg.norm(triangles, axis=1).sum())
+    cached = {
+        'vertices': vertex_indices,
+        'area': area,
+        'center': mesh_data['polygon_centers'][polygon_index],
+        'normal': mesh_data['polygon_normals'][polygon_index],
+    }
+    mesh_data['polygon_geometry'][polygon_index] = cached
+    return cached
+
+
+def _edge_neighbors(mesh_data, edge_index):
+    start = int(mesh_data['edge_starts'][edge_index])
+    end = int(mesh_data['edge_starts'][edge_index + 1])
+    return mesh_data['edge_polygons'][start:end]
+
+
+def _grow_planar_patch(mesh_data, seed_polygon, cos_planar=_FIT_COS_5):
+    if seed_polygon in mesh_data['polygon_patches']:
+        return mesh_data['polygon_patches'][seed_polygon]
+
+    component = {int(seed_polygon)}
+    queue = [int(seed_polygon)]
+    while queue:
+        polygon_index = queue.pop()
+        start = int(mesh_data['loop_starts'][polygon_index])
+        total = int(mesh_data['loop_totals'][polygon_index])
+        normal = mesh_data['polygon_normals'][polygon_index]
+        center = mesh_data['polygon_centers'][polygon_index]
+        for edge_index in mesh_data['loop_edges'][start:start + total]:
+            tolerance = max(0.005 * float(mesh_data['edge_lengths'][edge_index]), _FIT_ABS_TOL)
+            for neighbor in _edge_neighbors(mesh_data, int(edge_index)):
+                neighbor = int(neighbor)
+                if neighbor in component:
+                    continue
+                neighbor_normal = mesh_data['polygon_normals'][neighbor]
+                if float(normal @ neighbor_normal) < cos_planar:
+                    continue
+                neighbor_center = mesh_data['polygon_centers'][neighbor]
+                if abs(float((neighbor_center - center) @ normal)) > tolerance:
+                    continue
+                if abs(float((center - neighbor_center) @ neighbor_normal)) > tolerance:
+                    continue
+                component.add(neighbor)
+                queue.append(neighbor)
+
+    polygon_indices = np.array(sorted(component), dtype=np.int32)
+    geometry = [_polygon_geometry(mesh_data, int(index)) for index in polygon_indices]
+    areas = np.array([item['area'] for item in geometry], dtype=np.float64)
+    total_area = float(areas.sum())
+    patch = None
+    if total_area > 0:
+        point = (mesh_data['polygon_centers'][polygon_indices] * areas[:, None]).sum(axis=0) / total_area
+        normal = (mesh_data['polygon_normals'][polygon_indices] * areas[:, None]).sum(axis=0)
+        normal_length = float(np.linalg.norm(normal))
+        if normal_length > 0:
+            normal /= normal_length
+            vertex_indices = np.unique(np.concatenate([item['vertices'] for item in geometry]))
+            coordinates = mesh_data['vertices'][vertex_indices]
+            extent = float(np.linalg.norm(coordinates.max(axis=0) - coordinates.min(axis=0)))
+            tolerance = max(0.005 * extent, _FIT_ABS_TOL)
+            residual = float(np.max(np.abs((mesh_data['polygon_centers'][polygon_indices] - point) @ normal)))
+            if extent > 0 and residual <= tolerance:
+                boundary_edges = set()
+                for polygon_index in polygon_indices:
+                    start = int(mesh_data['loop_starts'][polygon_index])
+                    total = int(mesh_data['loop_totals'][polygon_index])
+                    for edge_index in mesh_data['loop_edges'][start:start + total]:
+                        neighbors = _edge_neighbors(mesh_data, int(edge_index))
+                        if any(int(neighbor) not in component for neighbor in neighbors):
+                            boundary_edges.add(int(edge_index))
+                patch = {
+                    'id': tuple(int(index) for index in polygon_indices),
+                    'polygons': component,
+                    'boundary_edges': tuple(sorted(boundary_edges)),
+                    'point': point,
+                    'normal': normal,
+                    'area': total_area,
+                    'extent': extent,
+                    'residual': residual,
+                    'tolerance': tolerance,
+                }
+
+    for polygon_index in component:
+        mesh_data['polygon_patches'][polygon_index] = patch
+    return patch
+
+
+def _patch_sort_key(patch):
+    normal = patch['normal'].copy()
+    dominant = int(np.argmax(np.abs(normal)))
+    if normal[dominant] < 0:
+        normal *= -1.0
+    return tuple(np.round(normal, 9)) + (
+        round(float(normal @ patch['point']), 9),
+        round(float(patch['area']), 9),
+    )
+
+
+def _candidate_patches(mesh_data, seed_polygons):
+    patches = {}
+    frontier = []
+    for polygon_index in seed_polygons:
+        patch = _grow_planar_patch(mesh_data, int(polygon_index))
+        if patch is not None and patch['id'] not in patches:
+            patches[patch['id']] = patch
+            frontier.append(patch)
+
+    for _ in range(2):
+        next_frontier = []
+        for patch in frontier:
+            for edge_index in patch['boundary_edges']:
+                for polygon_index in _edge_neighbors(mesh_data, edge_index):
+                    polygon_index = int(polygon_index)
+                    if polygon_index in patch['polygons']:
+                        continue
+                    neighbor = _grow_planar_patch(mesh_data, polygon_index)
+                    if neighbor is not None and neighbor['id'] not in patches:
+                        patches[neighbor['id']] = neighbor
+                        next_frontier.append(neighbor)
+        frontier = next_frontier
+    return sorted(patches.values(), key=_patch_sort_key)
 
 
 def compute_precision_fit(context, settings,
