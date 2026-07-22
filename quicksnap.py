@@ -105,6 +105,9 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.snap_paused = False
         self.no_selection_target = None
         self.ignore_modifiers = self.settings.ignore_modifiers
+        self.source_object = ""
+        self.source_element_index = -1
+        self.source_snap_type = ""
         self.target_face_index = -1
         self.target_object_display_backup = {}
         self.source_highlight_data = {}
@@ -303,10 +306,16 @@ class QuickVertexSnapOperator(bpy.types.Operator):
             return
         if self.closest_target_id in self.snapdata_target.origins_map:
             return
+        if self.source_snap_type not in {'POINTS', 'MIDPOINTS', 'FACES'}:
+            return
+        if self.snapdata_target.snap_type not in {'POINTS', 'MIDPOINTS', 'FACES'}:
+            return
         try:
-            fit = quicksnap_utils.compute_precision_fit(context, self.settings, self.selection_objects,
-                                                        self.target_object, self.target,
-                                                        sample_count=self.settings.precision_fit_samples)
+            fit = quicksnap_utils.compute_precision_fit(
+                context, self.settings,
+                self.source_object, self.source_snap_type, self.source_element_index,
+                self.target_object, self.snapdata_target.snap_type, self.closest_vertexid,
+                self.target)
         except Exception as error:
             logger.warning(f"Precision fit skipped: {error}")
             return
@@ -399,6 +408,9 @@ class QuickVertexSnapOperator(bpy.types.Operator):
                                                         corner_score_fn=self.get_corner_score_fn(self.snapdata_source))
             if closest is not None:
                 (self.closest_source_id, self.distance, target_name, is_root, mesh_vertid) = closest
+                self.source_object = target_name
+                self.source_element_index = mesh_vertid
+                self.source_snap_type = self.snapdata_source.snap_type
                 self.set_object_display(target_name, hover_object, is_root)
                 if self.object_mode and self.no_selection and self.no_selection_target is None or \
                         self.no_selection_target != target_name:
@@ -551,6 +563,9 @@ class QuickVertexSnapOperator(bpy.types.Operator):
         self.perf_wire_ms = 0.0
         self.selection_hidden = False
         self.snap_paused = False
+        self.source_object = ""
+        self.source_element_index = -1
+        self.source_snap_type = ""
         self.target_bounds = None
         self.source_highlight_data = None
         self.source_allowed_indices = None

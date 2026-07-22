@@ -161,8 +161,10 @@ def is_heavy_object(obj, settings=None, depsgraph=None):
     return get_object_vertex_count(obj, depsgraph) >= settings.heavy_mesh_threshold * 1000
 
 
-def compute_precision_fit(context, settings, object_names, target_object_name, contact_point,
-                          sample_count=300, iterations=12):
+def compute_precision_fit(context, settings,
+                          source_object_name, source_snap_type, source_element_index,
+                          target_object_name, target_snap_type, target_element_index,
+                          contact_point):
     """
     Post-snap refinement: translation-only ICP between the moving objects' vertices around the
     snapped point and the target mesh surface. Sampling is anchored to the snapped point (the peg),
@@ -170,6 +172,9 @@ def compute_precision_fit(context, settings, object_names, target_object_name, c
     other, so complex geometry around the mating features does not pull the fit.
     Returns a world-space correction Vector, or None when there is nothing reliable to fit.
     """
+    object_names = [source_object_name]
+    sample_count = 300
+    iterations = 12
     target_obj = bpy.data.objects.get(target_object_name)
     if target_obj is None or target_obj.type != 'MESH':
         return None
