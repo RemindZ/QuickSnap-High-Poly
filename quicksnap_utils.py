@@ -459,22 +459,14 @@ def _match_plane_pairs(source_pairs, target_pairs, contact):
             'tolerance': tolerance,
         })
 
-    independent = []
-    remaining = sorted(matches, key=lambda item: tuple(np.round(item['axis'], 9)))
-    while remaining:
-        match = remaining.pop(0)
-        # Competing source slabs on one axis are ambiguous; never let polygon order choose one.
-        same_axis = []
-        next_remaining = []
-        for other in remaining:
-            if abs(float(match['axis'] @ other['axis'])) >= _FIT_COS_5:
-                same_axis.append(other)
-            else:
-                next_remaining.append(other)
-        remaining = next_remaining
-        if not same_axis:
-            independent.append(match)
-    return independent
+    # Competing source slabs on one axis are ambiguous; never let polygon order choose one.
+    return [
+        match for index, match in enumerate(matches)
+        if not any(
+            index != other_index and abs(float(match['axis'] @ other['axis'])) >= _FIT_COS_5
+            for other_index, other in enumerate(matches)
+        )
+    ]
 
 
 def _solve_pair_translation(matches):

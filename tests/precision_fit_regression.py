@@ -249,6 +249,21 @@ def assert_valid_axis_survives_other_axis_ambiguity():
     assert_vector_close(Vector(translation), Vector((0.0, 0.1, 0.0)), tolerance=1e-9)
 
 
+def assert_chained_source_axis_ambiguity_rejected():
+    axes = [
+        (math.cos(math.radians(angle)), math.sin(math.radians(angle)), 0.0)
+        for angle in (0.0, 4.0, 8.0)
+    ]
+    sources = [synthetic_pair(axis, -0.5, 0.5, 0.001, (0, 0, 0)) for axis in axes]
+    targets = [
+        synthetic_pair(axis, -0.5, 0.7, 0.001, (0, 0, distance), inward=True)
+        for axis, distance in zip(axes, (1.0, 2.0, 3.0))
+    ]
+    matches = quicksnap_utils._match_plane_pairs(sources, targets, np.zeros(3))
+    if matches:
+        raise AssertionError("chained near-parallel source constraints must all be ambiguous")
+
+
 def clear_scene():
     bpy.ops.object.select_all(action='SELECT')
     bpy.ops.object.delete(use_global=False)
@@ -399,6 +414,8 @@ def main():
     print("source ambiguity: PASS")
     assert_valid_axis_survives_other_axis_ambiguity()
     print("partial ambiguity: PASS")
+    assert_chained_source_axis_ambiguity_rejected()
+    print("chained ambiguity: PASS")
     coarse_fit = None
     for subdivisions, reverse_face_order in ((1, False), (8, False), (8, True)):
         fit = run_corner_case(subdivisions, reverse_face_order)
