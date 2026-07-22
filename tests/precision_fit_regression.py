@@ -279,6 +279,46 @@ def run_neighboring_socket_case():
     return run_pair(peg, peg_seed, sockets, socket_seed)
 
 
+def run_non_uniform_scale_case(apply_scale):
+    clear_scene()
+    peg, peg_seed = make_peg()
+    socket, socket_seed = make_socket()
+    for obj in (peg, socket):
+        obj.scale = (2.0, 0.5, 1.5)
+        obj.select_set(True)
+    if apply_scale:
+        bpy.context.view_layer.objects.active = peg
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    bpy.context.view_layer.update()
+    return run_pair(peg, peg_seed, socket, socket_seed)
+
+
+def run_modifier_case(ignore_modifiers):
+    clear_scene()
+    peg, peg_seed = make_peg()
+    slot, slot_seed = make_slot()
+    high_wall = slot.vertex_groups.new(name="HighWall")
+    high_wall.add(
+        [vertex.index for vertex in slot.data.vertices if vertex.co.x > 0.59],
+        1.0,
+        'REPLACE',
+    )
+    modifier = slot.modifiers.new(name="WidenSlot", type='DISPLACE')
+    modifier.direction = 'X'
+    modifier.strength = 0.2
+    modifier.mid_level = 0.0
+    modifier.vertex_group = high_wall.name
+    bpy.context.view_layer.update()
+    contact = slot.matrix_world @ slot.data.vertices[slot_seed].co
+    return quicksnap_utils.compute_precision_fit(
+        bpy.context,
+        SimpleNamespace(ignore_modifiers=ignore_modifiers),
+        peg.name, 'POINTS', peg_seed,
+        slot.name, 'POINTS', slot_seed,
+        contact,
+    )
+
+
 def main():
     for subdivisions, reverse_face_order in ((1, False), (8, False), (8, True)):
         fit = run_corner_case(subdivisions, reverse_face_order)
@@ -298,6 +338,14 @@ def main():
     print("stale index: PASS")
     assert_vector_close(run_neighboring_socket_case(), Vector((0.1, 0.1, 0.0)), tolerance=1e-7)
     print("neighboring socket: PASS")
+    scaled = run_non_uniform_scale_case(apply_scale=False)
+    applied = run_non_uniform_scale_case(apply_scale=True)
+    assert_vector_close(scaled, Vector((0.2, 0.05, 0.0)), tolerance=1e-7)
+    assert_vector_close(applied, scaled, tolerance=1e-7)
+    print("non-uniform scale: PASS")
+    assert_vector_close(run_modifier_case(ignore_modifiers=False), Vector((0.2, 0.0, 0.0)), tolerance=1e-7)
+    assert_vector_close(run_modifier_case(ignore_modifiers=True), Vector((0.1, 0.0, 0.0)), tolerance=1e-7)
+    print("modifiers: PASS")
     print("precision_fit_regression: PASS")
 
 

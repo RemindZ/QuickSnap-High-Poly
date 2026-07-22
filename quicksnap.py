@@ -1155,16 +1155,9 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
     # Post-snap precision fit (object mode).
     precision_fit: bpy.props.BoolProperty(
         name="Post-snap precision fit (object mode)",
-        description="After snapping, nudge the selection (translation only, no rotation) so the"
-                    " geometry around the snapped point seats onto the target surface. Useful for"
-                    " pegs/holes whose vertices do not correspond exactly. Skipped when an axis"
-                    " constraint is active",
+        description="After snapping, center clean peg/socket or slot clearance using translation"
+                    " only. Ambiguous geometry and axis-constrained snaps are skipped",
         default=True)
-    precision_fit_samples: bpy.props.IntProperty(
-        name="Fit samples",
-        description="How many vertices around the snapped point are matched against the target"
-                    " surface when fitting",
-        default=300, min=50, max=2000)
 
     snap_source_type: bpy.props.EnumProperty(
         name="Snap From",
@@ -1252,8 +1245,6 @@ class QuickVertexSnapPreference(bpy.types.AddonPreferences):
         fit_box = col.box().column()
         fit_box.label(text="Precision fit:")
         fit_box.prop(self, "precision_fit")
-        if self.precision_fit:
-            fit_box.prop(self, "precision_fit_samples")
         col.prop(self, "snap_objects_origin")
         col.prop(self, "draw_rubberband")
         col.prop(self, "hide_selection_over_target")
