@@ -52,10 +52,10 @@ assert_vector_close(fit, Vector((0.1, 0.1, 0.0)))
 Run:
 
 ```powershell
-& 'C:\Program Files\Blender Foundation\Blender 5.0\blender.exe' --background --factory-startup --python tests\precision_fit_regression.py
+& 'C:\Program Files\Blender Foundation\Blender 5.0\blender.exe' --background --factory-startup --python-exit-code 1 --python tests\precision_fit_regression.py
 ```
 
-Expected: nonzero exit with `TypeError: compute_precision_fit() takes from 5 to 7 positional arguments but 10 were given` because the current function does not accept source and target feature descriptors.
+Expected: nonzero exit with `TypeError: compute_precision_fit() takes from 5 to 7 positional arguments but 9 were given` because the current function does not accept source and target feature descriptors.
 
 - [ ] **Step 3: Commit the RED harness**
 
@@ -355,7 +355,7 @@ Run:
 
 ```powershell
 python -m py_compile quicksnap.py quicksnap_utils.py tests\precision_fit_regression.py
-& 'C:\Program Files\Blender Foundation\Blender 5.0\blender.exe' --background --factory-startup --python tests\precision_fit_regression.py
+& 'C:\Program Files\Blender Foundation\Blender 5.0\blender.exe' --background --factory-startup --python-exit-code 1 --python tests\precision_fit_regression.py
 ```
 
 Expected: both commands exit 0; harness ends with `precision_fit_regression: PASS`.
@@ -396,7 +396,7 @@ Run:
 
 ```powershell
 python -m py_compile __init__.py quicksnap.py quicksnap_utils.py quicksnap_snapdata.py quicksnap_render.py
-& 'C:\Program Files\Blender Foundation\Blender 5.0\blender.exe' --background --factory-startup --python tests\precision_fit_regression.py
+& 'C:\Program Files\Blender Foundation\Blender 5.0\blender.exe' --background --factory-startup --python-exit-code 1 --python tests\precision_fit_regression.py
 git diff --check
 git status --short
 ```
