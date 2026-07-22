@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import bpy
 from mathutils import Vector
+import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,14 +45,18 @@ class MeshBuilder:
     def index(self, point):
         return self._indices[self._key(point)]
 
-    def quad_grid(self, p00, p10, p11, p01, subdivisions):
+    def quad_grid(self, p00, p10, p11, p01, subdivisions, triangulate=False, uneven=False):
         corners = tuple(Vector(point) for point in (p00, p10, p11, p01))
         grid = []
         for row in range(subdivisions + 1):
             v = row / subdivisions
+            if uneven:
+                v = v ** 1.5
             indices = []
             for column in range(subdivisions + 1):
                 u = column / subdivisions
+                if uneven:
+                    u = u ** 2
                 point = ((1 - u) * (1 - v) * corners[0] +
                          u * (1 - v) * corners[1] +
                          u * v * corners[2] +
@@ -60,15 +65,21 @@ class MeshBuilder:
             grid.append(indices)
         for row in range(subdivisions):
             for column in range(subdivisions):
-                self.faces.append((
-                    grid[row][column],
-                    grid[row][column + 1],
-                    grid[row + 1][column + 1],
-                    grid[row + 1][column],
-                ))
+                low_left = grid[row][column]
+                low_right = grid[row][column + 1]
+                high_right = grid[row + 1][column + 1]
+                high_left = grid[row + 1][column]
+                if not triangulate:
+                    self.faces.append((low_left, low_right, high_right, high_left))
+                elif (row + column) % 2 == 0:
+                    self.faces.extend(((low_left, low_right, high_right),
+                                       (low_left, high_right, high_left)))
+                else:
+                    self.faces.extend(((low_left, low_right, high_left),
+                                       (low_right, high_right, high_left)))
 
 
-def make_peg(subdivisions=1, reverse_face_order=False):
+def make_peg(subdivisions=1, reverse_face_order=False, triangulate=False, uneven=False):
     builder = MeshBuilder()
     quads = [
         ((-0.6, -0.7, -1.0), (-0.6, 0.5, -1.0), (0.4, 0.5, -1.0), (0.4, -0.7, -1.0)),
@@ -79,13 +90,14 @@ def make_peg(subdivisions=1, reverse_face_order=False):
         ((-0.6, 0.5, -1.0), (-0.6, -0.7, -1.0), (-0.6, -0.7, 0.0), (-0.6, 0.5, 0.0)),
     ]
     for quad in quads:
-        builder.quad_grid(*quad, subdivisions)
+        builder.quad_grid(*quad, subdivisions, triangulate, uneven)
     seed = builder.index((-0.6, -0.7, 0.0))
     return make_mesh("Peg", builder.vertices, builder.faces, reverse_face_order), seed
 
 
 def make_socket(subdivisions=1, reverse_face_order=False,
-                x_bounds=(-0.6, 0.6), y_bounds=(-0.7, 0.7)):
+                x_bounds=(-0.6, 0.6), y_bounds=(-0.7, 0.7),
+                triangulate=False, uneven=False):
     builder = MeshBuilder()
     x_low, x_high = x_bounds
     y_low, y_high = y_bounds
@@ -100,7 +112,7 @@ def make_socket(subdivisions=1, reverse_face_order=False,
         ((x_low, y_high, 0.0), (x_low, y_low, 0.0), (x_low, y_low, -1.2), (x_low, y_high, -1.2)),
     ]
     for quad in quads:
-        builder.quad_grid(*quad, subdivisions)
+        builder.quad_grid(*quad, subdivisions, triangulate, uneven)
     seed = builder.index((x_low, y_low, 0.0))
     return make_mesh("Socket", builder.vertices, builder.faces, reverse_face_order), seed
 
@@ -183,6 +195,60 @@ def assert_patch_directions(obj, seed, expected_directions):
             raise AssertionError(f"missing patch normal {tuple(expected)}; got {[tuple(n) for n in normals]}")
 
 
+def synthetic_pair(axis, low, high, tolerance, center, inward=False):
+    axis = np.array(axis, dtype=np.float64)
+    low_normal = axis if inward else -axis
+    high_normal = -axis if inward else axis
+    return {
+        'axis': axis,
+        'low_patch': {'normal': low_normal},
+        'high_patch': {'normal': high_normal},
+        'low': low,
+        'high': high,
+        'mid': 0.5 * (low + high),
+        'center': np.array(center, dtype=np.float64),
+        'separation': high - low,
+        'tolerance': tolerance,
+    }
+
+
+def assert_overlapping_target_ambiguity_rejected():
+    source = synthetic_pair((1, 0, 0), -0.5, 0.5, 0.05, (0, 0, 0))
+    targets = [
+        synthetic_pair((1, 0, 0), -0.5, 0.7, 0.05, (0, 1.0, 0), inward=True),
+        synthetic_pair((1, 0, 0), -0.5, 0.7, 0.05, (0, 1.15, 0), inward=True),
+    ]
+    matches = quicksnap_utils._match_plane_pairs([source], targets, np.zeros(3))
+    if matches:
+        raise AssertionError("overlapping target uncertainty bands must be ambiguous")
+
+
+def assert_competing_source_pairs_rejected():
+    sources = [
+        synthetic_pair((1, 0, 0), -0.5, 0.5, 0.01, (0, 0, 0)),
+        synthetic_pair((1, 0, 0), -0.4, 0.6, 0.01, (0.1, 0, 0)),
+    ]
+    target = synthetic_pair((1, 0, 0), -0.5, 0.7, 0.01, (0.1, 0, 0), inward=True)
+    matches = quicksnap_utils._match_plane_pairs(sources, [target], np.zeros(3))
+    if matches:
+        raise AssertionError("competing source slabs on one axis must be ambiguous")
+
+
+def assert_valid_axis_survives_other_axis_ambiguity():
+    sources = [
+        synthetic_pair((1, 0, 0), -0.5, 0.5, 0.01, (0, 0, 0)),
+        synthetic_pair((1, 0, 0), -0.4, 0.6, 0.01, (0.1, 0, 0)),
+        synthetic_pair((0, 1, 0), -0.5, 0.5, 0.01, (0, 0, 0)),
+    ]
+    targets = [
+        synthetic_pair((1, 0, 0), -0.5, 0.7, 0.01, (0.1, 0, 0), inward=True),
+        synthetic_pair((0, 1, 0), -0.5, 0.7, 0.01, (0, 0.1, 0), inward=True),
+    ]
+    matches = quicksnap_utils._match_plane_pairs(sources, targets, np.zeros(3))
+    translation = quicksnap_utils._solve_pair_translation(matches)
+    assert_vector_close(Vector(translation), Vector((0.0, 0.1, 0.0)), tolerance=1e-9)
+
+
 def clear_scene():
     bpy.ops.object.select_all(action='SELECT')
     bpy.ops.object.delete(use_global=False)
@@ -210,6 +276,13 @@ def run_corner_case(subdivisions, reverse_face_order):
         socket.name, 'POINTS', socket_seed,
         contact,
     )
+
+
+def run_uneven_density_case():
+    clear_scene()
+    peg, peg_seed = make_peg(7, triangulate=True, uneven=True)
+    socket, socket_seed = make_socket(11, triangulate=True, uneven=True)
+    return run_pair(peg, peg_seed, socket, socket_seed)
 
 
 def run_slot_case():
@@ -320,10 +393,24 @@ def run_modifier_case(ignore_modifiers):
 
 
 def main():
+    assert_overlapping_target_ambiguity_rejected()
+    print("target ambiguity: PASS")
+    assert_competing_source_pairs_rejected()
+    print("source ambiguity: PASS")
+    assert_valid_axis_survives_other_axis_ambiguity()
+    print("partial ambiguity: PASS")
+    coarse_fit = None
     for subdivisions, reverse_face_order in ((1, False), (8, False), (8, True)):
         fit = run_corner_case(subdivisions, reverse_face_order)
         assert_vector_close(fit, Vector((0.1, 0.1, 0.0)), tolerance=1e-7)
+        if coarse_fit is None:
+            coarse_fit = fit
         print(f"corner subdivisions={subdivisions} reverse={reverse_face_order}: PASS")
+    uneven_fit = run_uneven_density_case()
+    assert_vector_close(uneven_fit, coarse_fit, tolerance=1.4e-9)
+    if uneven_fit.z != 0.0:
+        raise AssertionError(f"unconstrained Z changed: {uneven_fit.z}")
+    print("uneven triangulation: PASS")
     assert_vector_close(run_slot_case(), Vector((0.1, 0.0, 0.0)), tolerance=1e-7)
     print("slot: PASS")
     assert run_wedge_case(120) is None

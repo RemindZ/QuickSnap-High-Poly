@@ -294,9 +294,9 @@ class QuickVertexSnapOperator(bpy.types.Operator):
 
     def run_precision_fit(self, context):
         """
-        Optional post-snap refinement (object mode): nudge the selection so the geometry around the
-        snapped point seats onto the target surface. Translation only, runs once on confirm.
-        Skipped with axis constraints (it would break them) and origin/cursor/free-space targets.
+        Optional post-snap refinement (object mode): center clean opposed plane pairs seeded by the
+        snapped elements. Translation only, runs once on confirm. Skipped with axis constraints
+        (it would break them) and origin/cursor/free-space targets.
         """
         if not getattr(self.settings, "precision_fit", False):
             return
