@@ -38,7 +38,7 @@ releases/*.zip
 
 - [ ] **Step 2: Add the minimal build script**
 
-Create `build_release.ps1` with an explicit file allowlist, `icons/` recursive copy, temporary staging under the system temp directory, replacement of an existing same-version ZIP, and a `finally` cleanup. Parse the three numeric version components from `__init__.py`; throw when parsing fails. After `Compress-Archive`, open the ZIP with `System.IO.Compression.ZipFile` and throw unless these entries exist:
+Create `build_release.ps1` with an explicit file allowlist, a top-level `icons/*.tif` runtime-asset copy, temporary staging under the system temp directory, replacement of an existing same-version ZIP, and a `finally` cleanup. Parse the three numeric version components from `__init__.py`; throw when parsing fails. After `Compress-Archive`, open the ZIP with `System.IO.Compression.ZipFile` and throw unless these entries exist:
 
 ```text
 QuickSnap/__init__.py
