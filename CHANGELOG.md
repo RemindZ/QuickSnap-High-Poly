@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.13
+
+### Changed
+- Post-snap precision fit now uses the exact snapped source and target elements
+  as datum seeds, then centers clean opposed plane pairs. Rectangular pegs and
+  slots fit deterministically regardless of mesh density or polygon order,
+  while insertion depth and every other unconstrained direction stay fixed.
+- Ambiguous, organic, stale, equal-width, or impossible geometry is safely
+  skipped instead of falling back to surface-distance fitting. The obsolete
+  fit sample-count setting has been removed.
+
 ## 1.5.12
 
 ### Fixed
